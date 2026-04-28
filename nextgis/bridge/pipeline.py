@@ -1,0 +1,1211 @@
+from __future__ import annotations
+
+import argparse
+import gzip
+import hashlib
+import io
+import json
+import os
+import re
+import shutil
+import subprocess
+import tarfile
+import tempfile
+import urllib.request
+import zipfile
+
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+
+from .config import BridgeConfiguration, QtIfwComponent
+
+
+ASSIGNMENT_RE = re.compile(r"^export\s+(?P<name>[A-Z_]+)=(?P<value>.+)$")
+DEFAULT_ASSIGNMENT_RE = re.compile(
+	r"^:\s+\$\{(?P<name>[A-Z_]+):=(?P<value>.*)\}$"
+)
+CL_VERSION_RE = re.compile(r"Version\s+(?P<major>\d+)\.(?P<minor>\d+)")
+PACKAGE_VERSION_RE = re.compile(
+    r"^(?P<version>.+)-(?P<binary>\d+|next|tbd)$"
+)
+
+
+@dataclass
+class SourceRecipe:
+    name: str
+    package_script: Path
+    package_names: List[str]
+    build_depends: List[str]
+
+    @property
+    def osgeo4w_dir(self) -> Path:
+        return self.package_script.parent
+
+
+@dataclass
+class BuildSnapshot:
+    config_digest: str
+    packages: Dict[str, Dict[str, object]]
+
+
+class WorkspaceModel:
+    def __init__(
+        self,
+        root_dir: Path,
+        recipes: Dict[str, SourceRecipe],
+    ) -> None:
+        self.root_dir = root_dir
+        self.recipes = recipes
+        self.package_to_source = self._build_package_index()
+        self.forward_dependencies = self._build_forward_dependencies()
+        self.reverse_dependencies = self._build_reverse_dependencies()
+
+    @classmethod
+    def discover(cls, root_dir: Path) -> "WorkspaceModel":
+        recipes: Dict[str, SourceRecipe] = {}
+        for package_script in sorted(root_dir.glob("src/*/osgeo4w/package.sh")):
+            recipe = parse_recipe(package_script)
+            recipes[recipe.name] = recipe
+        return cls(root_dir=root_dir, recipes=recipes)
+
+    def resolve_source_name(self, name: str) -> str:
+        if name in self.recipes:
+            return name
+        if name in self.package_to_source:
+            return self.package_to_source[name]
+        raise KeyError(f"Unknown package or source recipe: {name}")
+
+    def source_names(self) -> List[str]:
+        return sorted(self.recipes)
+
+    def build_targets(
+        self,
+        names: Iterable[str],
+        include_reverse_dependencies: bool,
+        disabled: Set[str],
+    ) -> List[str]:
+        source_names = {self.resolve_source_name(name) for name in names}
+        filtered_names = {name for name in source_names if name not in disabled}
+        if not include_reverse_dependencies:
+            return sorted(filtered_names)
+        result = set(filtered_names)
+        queue = list(filtered_names)
+        while queue:
+            current_name = queue.pop(0)
+            for dependent_name in self.reverse_dependencies.get(
+                current_name,
+                set(),
+            ):
+                if dependent_name in disabled or dependent_name in result:
+                    continue
+                result.add(dependent_name)
+                queue.append(dependent_name)
+        return sorted(result)
+
+    def bootstrap_sources(
+        self,
+        target_names: Iterable[str],
+        disabled: Set[str],
+    ) -> List[str]:
+        source_names = {self.resolve_source_name(name) for name in target_names}
+        result: Set[str] = set()
+        queue = list(source_names)
+        while queue:
+            current_name = queue.pop(0)
+            for dependency_name in self.forward_dependencies.get(
+                current_name,
+                set(),
+            ):
+                if dependency_name in disabled or dependency_name in source_names:
+                    continue
+                if dependency_name in result:
+                    continue
+                result.add(dependency_name)
+                queue.append(dependency_name)
+        return sorted(result)
+
+    def snapshot(
+        self,
+        configuration: BridgeConfiguration,
+    ) -> BuildSnapshot:
+        package_data: Dict[str, Dict[str, object]] = {}
+        config_digest = sha256_text(
+            json.dumps(configuration.raw_data, sort_keys=True)
+        )
+        for source_name, recipe in self.recipes.items():
+            payload = configuration.relevant_payload(source_name)
+            digest = sha256_text(json.dumps(payload, sort_keys=True))
+            for file_path in sorted(recipe.osgeo4w_dir.rglob("*")):
+                if file_path.is_file():
+                    digest = sha256_chain(digest, sha256_file(file_path))
+            package_data[source_name] = {
+                "digest": digest,
+                "package_names": recipe.package_names,
+                "build_depends": recipe.build_depends,
+            }
+        return BuildSnapshot(config_digest=config_digest, packages=package_data)
+
+    def _build_package_index(self) -> Dict[str, str]:
+        index: Dict[str, str] = {}
+        for source_name, recipe in self.recipes.items():
+            for package_name in recipe.package_names:
+                index[package_name] = source_name
+        return index
+
+    def _build_forward_dependencies(self) -> Dict[str, Set[str]]:
+        forward_dependencies: Dict[str, Set[str]] = {
+            source_name: set() for source_name in self.recipes
+        }
+        for source_name, recipe in self.recipes.items():
+            for package_name in recipe.build_depends:
+                dependency_source = self.package_to_source.get(package_name)
+                if dependency_source is None or dependency_source == source_name:
+                    continue
+                forward_dependencies[source_name].add(dependency_source)
+        return forward_dependencies
+
+    def _build_reverse_dependencies(self) -> Dict[str, Set[str]]:
+        reverse_dependencies: Dict[str, Set[str]] = {
+            source_name: set() for source_name in self.recipes
+        }
+        for source_name, dependencies in self.forward_dependencies.items():
+            for dependency_name in dependencies:
+                reverse_dependencies[dependency_name].add(source_name)
+        return reverse_dependencies
+
+
+def parse_recipe(package_script: Path) -> SourceRecipe:
+    exports: Dict[str, str] = {}
+    with package_script.open("r", encoding="utf-8") as file_handle:
+        for line in file_handle:
+            stripped_line = line.strip()
+            match = ASSIGNMENT_RE.match(stripped_line)
+            if match is None:
+                match = DEFAULT_ASSIGNMENT_RE.match(stripped_line)
+            if match is None:
+                continue
+            name = match.group("name")
+            if name not in {"P", "PACKAGES", "BUILDDEPENDS"}:
+                continue
+            value = match.group("value").strip()
+            if value.startswith('"') and value.endswith('"'):
+                value = value[1:-1]
+            if value.startswith("'") and value.endswith("'"):
+                value = value[1:-1]
+            value = expand_shell_variables(value, exports)
+            exports[name] = value
+    build_depends = split_export(exports.get("BUILDDEPENDS", ""))
+    if build_depends == ["none"]:
+        build_depends = []
+    return SourceRecipe(
+        name=package_script.parent.parent.name,
+        package_script=package_script,
+        package_names=split_export(exports.get("PACKAGES", "")),
+        build_depends=build_depends,
+    )
+
+
+def split_export(value: str) -> List[str]:
+    if not value:
+        return []
+    return [token for token in value.split() if token]
+
+
+def expand_shell_variables(
+    value: str,
+    variables: Dict[str, str],
+) -> str:
+    for key, replacement in variables.items():
+        value = value.replace(f"${{{key}}}", replacement)
+        value = value.replace(f"${key}", replacement)
+    return value
+
+
+def sha256_file(file_path: Path) -> str:
+    digest = hashlib.sha256()
+    with file_path.open("rb") as file_handle:
+        for chunk in iter(lambda: file_handle.read(65536), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def sha256_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def sha256_chain(first_value: str, second_value: str) -> str:
+    return sha256_text(f"{first_value}:{second_value}")
+
+
+def run_command(
+    args: Sequence[str],
+    cwd: Path,
+    environment: Optional[Dict[str, str]] = None,
+    capture_output: bool = False,
+) -> subprocess.CompletedProcess[str]:
+    merged_environment = os.environ.copy()
+    if environment:
+        merged_environment.update(environment)
+    return subprocess.run(
+        list(args),
+        cwd=str(cwd),
+        env=merged_environment,
+        text=True,
+        check=True,
+        capture_output=capture_output,
+    )
+
+
+def detect_compiler_tag() -> str:
+    explicit_value = os.environ.get("NEXTGIS_COMPILER_TAG")
+    if explicit_value:
+        return explicit_value
+    try:
+        result = subprocess.run(
+            ["cl"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+    except FileNotFoundError:
+        return "unknown-compiler"
+    output = f"{result.stdout}\n{result.stderr}"
+    match = CL_VERSION_RE.search(output)
+    if match is None:
+        return "unknown-compiler"
+    suffix = (
+        "64bit"
+        if os.environ.get("Platform", "x64").lower() == "x64"
+        else "32bit"
+    )
+    return f"MSVC-{match.group('major')}.{match.group('minor')}-{suffix}"
+
+
+def parse_archive_version(package_name: str, archive_name: str) -> str:
+    prefix = f"{package_name}-"
+    if archive_name.endswith(".tar.bz2"):
+        archive_name = archive_name[:-8]
+    if not archive_name.startswith(prefix):
+        raise ValueError(f"Unexpected archive name: {archive_name}")
+    remainder = archive_name[len(prefix):]
+    match = PACKAGE_VERSION_RE.match(remainder)
+    if match is None:
+        return remainder
+    return match.group("version")
+
+
+def locate_archive_base(repo_root: Path) -> str:
+    version_file = repo_root / "build" / "version.str"
+    lines = version_file.read_text(encoding="utf-8").splitlines()
+    if len(lines) < 3:
+        raise ValueError(f"Malformed version.str in {version_file}")
+    return lines[2].strip()
+
+
+def write_version_file(repo_root: Path, version: str, archive_base: str) -> None:
+    build_dir = repo_root / "build"
+    build_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    version_file = build_dir / "version.str"
+    version_file.write_text(
+        f"{version}\n{timestamp}\n{archive_base}",
+        encoding="utf-8",
+    )
+
+
+def extract_tarball(archive_path: Path, destination_dir: Path) -> None:
+    with tarfile.open(archive_path, "r:bz2") as archive_handle:
+        archive_handle.extractall(path=destination_dir)
+
+
+def copy_directory_contents(source_dir: Path, destination_dir: Path) -> None:
+    for file_path in sorted(source_dir.rglob("*")):
+        if file_path.is_dir():
+            continue
+        relative_path = file_path.relative_to(source_dir)
+        target_path = destination_dir / relative_path
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(file_path, target_path)
+
+
+def should_skip_merge_path(relative_path: Path) -> bool:
+    parts = relative_path.parts
+    if len(parts) >= 2 and parts[0] == "etc" and parts[1] in {
+        "setup",
+        "postinstall",
+        "preremove",
+    }:
+        return True
+    if parts and parts[0] in {"usr", "var"}:
+        return True
+    return False
+
+
+def stage_osgeo4w_merge(install_root: Path, stage_root: Path) -> None:
+    for file_path in sorted(install_root.rglob("*")):
+        if file_path.is_dir():
+            continue
+        relative_path = file_path.relative_to(install_root)
+        if should_skip_merge_path(relative_path):
+            continue
+        target_path = stage_root / relative_path
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(file_path, target_path)
+
+
+def locate_python_root(install_root: Path, configured_root: str) -> Path:
+    apps_dir = install_root / "apps"
+    if apps_dir.exists():
+        python_directories = sorted(apps_dir.glob("Python*"))
+        if python_directories:
+            return python_directories[0]
+    return install_root / configured_root
+
+
+def stage_python_site_package(
+    install_root: Path,
+    stage_root: Path,
+    python_root: str,
+) -> None:
+    source_python_root = locate_python_root(install_root, python_root)
+    site_packages_dir = source_python_root / "Lib" / "site-packages"
+    scripts_dir = source_python_root / "Scripts"
+    if site_packages_dir.exists():
+        copy_directory_contents(
+            site_packages_dir,
+            stage_root / "Lib" / "site-packages",
+        )
+    if scripts_dir.exists():
+        copy_directory_contents(scripts_dir, stage_root / "Scripts")
+
+
+def create_zip_archive(
+    stage_root: Path,
+    zip_path: Path,
+    archive_base: str,
+) -> None:
+    with zipfile.ZipFile(
+        zip_path,
+        "w",
+        compression=zipfile.ZIP_DEFLATED,
+    ) as zip_handle:
+        for file_path in sorted(stage_root.rglob("*")):
+            if file_path.is_dir():
+                continue
+            relative_path = file_path.relative_to(stage_root)
+            archive_path = Path(archive_base) / relative_path
+            zip_handle.write(file_path, archive_path.as_posix())
+
+
+def package_source_recipe(
+    recipe: SourceRecipe,
+    configuration: BridgeConfiguration,
+    release_root: Path,
+    artifacts_root: Path,
+    compiler_tag: str,
+) -> Path:
+    descriptor = configuration.describe(recipe.name, recipe.package_names)
+    archives = find_release_archives(recipe, release_root)
+    primary_package = recipe.package_names[0]
+    version = parse_archive_version(
+        primary_package,
+        archives[primary_package].name,
+    )
+    archive_base = f"{descriptor.packet_name}-{version}-{compiler_tag}"
+    repo_root = artifacts_root / descriptor.repo_name
+    if repo_root.exists():
+        shutil.rmtree(repo_root)
+    repo_root.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=f"{recipe.name}-stage-") as temp_name:
+        temporary_dir = Path(temp_name)
+        install_root = temporary_dir / "install"
+        stage_root = temporary_dir / "stage"
+        install_root.mkdir(parents=True, exist_ok=True)
+        stage_root.mkdir(parents=True, exist_ok=True)
+        for archive_path in archives.values():
+            extract_tarball(archive_path, install_root)
+        if descriptor.packaging_class == "python-site-package":
+            stage_python_site_package(
+                install_root=install_root,
+                stage_root=stage_root,
+                python_root=configuration.python_root,
+            )
+        else:
+            stage_osgeo4w_merge(install_root=install_root, stage_root=stage_root)
+        build_dir = repo_root / "build"
+        build_dir.mkdir(parents=True, exist_ok=True)
+        create_zip_archive(
+            stage_root=stage_root,
+            zip_path=build_dir / f"{archive_base}.zip",
+            archive_base=archive_base,
+        )
+        copy_directory_contents(stage_root, repo_root)
+    write_version_file(
+        repo_root=repo_root,
+        version=version,
+        archive_base=archive_base,
+    )
+    write_repository_metadata(
+        repo_root=repo_root,
+        recipe=recipe,
+        repo_name=descriptor.repo_name,
+        packet_name=descriptor.packet_name,
+        packaging_class=descriptor.packaging_class,
+        version=version,
+        archive_base=archive_base,
+    )
+    return repo_root
+
+
+def write_repository_metadata(
+    repo_root: Path,
+    recipe: SourceRecipe,
+    repo_name: str,
+    packet_name: str,
+    packaging_class: str,
+    version: str,
+    archive_base: str,
+) -> None:
+    metadata_path = repo_root / "build" / "metadata.json"
+    metadata = {
+        "source_name": recipe.name,
+        "package_names": recipe.package_names,
+        "repo_name": repo_name,
+        "packet_name": packet_name,
+        "packaging_class": packaging_class,
+        "version": version,
+        "archive_base": archive_base,
+    }
+    metadata_path.write_text(
+        json.dumps(metadata, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+
+
+def find_release_archives(
+    recipe: SourceRecipe,
+    release_root: Path,
+) -> Dict[str, Path]:
+    archives: Dict[str, Path] = {}
+    for package_name in recipe.package_names:
+        candidates = [
+            path
+            for path in release_root.glob(f"**/{package_name}-*.tar.bz2")
+            if not path.name.endswith("-src.tar.bz2")
+        ]
+        if not candidates:
+            raise FileNotFoundError(
+                f"No release archive found for {package_name} under {release_root}"
+            )
+        candidates.sort(key=lambda path: path.stat().st_mtime)
+        archives[package_name] = candidates[-1]
+    return archives
+
+
+def load_snapshot_from_tag(
+    root_dir: Path,
+    tag_name: str,
+) -> Optional[BuildSnapshot]:
+    try:
+        result = run_command(
+            ["git", "show", f"{tag_name}:nextgis/state/build-manifest.json"],
+            cwd=root_dir,
+            capture_output=True,
+        )
+    except subprocess.CalledProcessError:
+        return None
+    payload = json.loads(result.stdout)
+    return BuildSnapshot(
+        config_digest=str(payload["config_digest"]),
+        packages=dict(payload["packages"]),
+    )
+
+
+def write_snapshot_file(snapshot: BuildSnapshot, output_path: Path) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(
+        json.dumps(
+            {
+                "config_digest": snapshot.config_digest,
+                "packages": snapshot.packages,
+            },
+            indent=2,
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+
+
+def changed_packages_since_tag(
+    root_dir: Path,
+    workspace: WorkspaceModel,
+    configuration: BridgeConfiguration,
+    tag_name: str,
+) -> List[str]:
+    current_snapshot = workspace.snapshot(configuration)
+    previous_snapshot = load_snapshot_from_tag(root_dir, tag_name)
+    if previous_snapshot is None:
+        return changed_packages_from_git_diff(root_dir, workspace, tag_name)
+    changed_names: List[str] = []
+    for source_name in workspace.source_names():
+        current_payload = current_snapshot.packages[source_name]
+        previous_payload = previous_snapshot.packages.get(source_name)
+        if previous_payload is None:
+            changed_names.append(source_name)
+            continue
+        if current_payload["digest"] != previous_payload.get("digest"):
+            changed_names.append(source_name)
+    return changed_names
+
+
+def changed_packages_from_git_diff(
+    root_dir: Path,
+    workspace: WorkspaceModel,
+    tag_name: str,
+) -> List[str]:
+    result = run_command(
+        ["git", "diff", "--name-only", f"{tag_name}..HEAD"],
+        cwd=root_dir,
+        capture_output=True,
+    )
+    changed_files = [
+        line.strip() for line in result.stdout.splitlines() if line.strip()
+    ]
+    changed_names: Set[str] = set()
+    for file_name in changed_files:
+        path = Path(file_name)
+        if len(path.parts) >= 4 and path.parts[0] == "src" and path.parts[2] == "osgeo4w":
+            changed_names.add(path.parts[1])
+            continue
+        if path.parts[:2] == ("nextgis", "config"):
+            return workspace.source_names()
+    return sorted(changed_names)
+
+
+def open_zip_reader(
+    artifacts_root: str,
+    repo_name: str,
+) -> Tuple[zipfile.ZipFile, io.BytesIO]:
+    if re.match(r"^https?://", artifacts_root):
+        version_url = f"{artifacts_root.rstrip('/')}/{repo_name}/build/version.str"
+        with urllib.request.urlopen(version_url) as response:
+            version_lines = response.read().decode("utf-8").splitlines()
+        archive_base = version_lines[2].strip()
+        archive_url = (
+            f"{artifacts_root.rstrip('/')}/{repo_name}/build/{archive_base}.zip"
+        )
+        with urllib.request.urlopen(archive_url) as response:
+            payload = io.BytesIO(response.read())
+        return zipfile.ZipFile(payload), payload
+    repo_root = Path(artifacts_root) / repo_name
+    archive_base = locate_archive_base(repo_root)
+    archive_path = repo_root / "build" / f"{archive_base}.zip"
+    return zipfile.ZipFile(archive_path), io.BytesIO()
+
+
+def hydrate_source_recipe(
+    recipe: SourceRecipe,
+    configuration: BridgeConfiguration,
+    artifacts_root: str,
+    install_root: Path,
+) -> None:
+    descriptor = configuration.describe(recipe.name, recipe.package_names)
+    zip_handle, _payload = open_zip_reader(artifacts_root, descriptor.repo_name)
+    with zip_handle:
+        names = [
+            name for name in zip_handle.namelist() if name and not name.endswith("/")
+        ]
+        top_level_prefix = ""
+        if names:
+            top_level_prefix = names[0].split("/", 1)[0]
+        for member_name in names:
+            relative_name = member_name
+            if top_level_prefix and member_name.startswith(f"{top_level_prefix}/"):
+                relative_name = member_name[len(top_level_prefix) + 1 :]
+            if not relative_name:
+                continue
+            target_path = map_hydrated_path(
+                packaging_class=descriptor.packaging_class,
+                configuration=configuration,
+                install_root=install_root,
+                relative_name=relative_name,
+            )
+            if target_path is None:
+                continue
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            with zip_handle.open(member_name) as source_handle:
+                with target_path.open("wb") as target_handle:
+                    shutil.copyfileobj(source_handle, target_handle)
+    write_hydration_markers(install_root=install_root, recipe=recipe)
+
+
+def map_hydrated_path(
+    packaging_class: str,
+    configuration: BridgeConfiguration,
+    install_root: Path,
+    relative_name: str,
+) -> Optional[Path]:
+    relative_path = Path(relative_name)
+    if packaging_class == "python-site-package":
+        python_root = locate_python_root(install_root, configuration.python_root)
+        if relative_name.startswith("Lib/site-packages/"):
+            suffix = relative_path.relative_to(Path("Lib/site-packages"))
+            return python_root / "Lib" / "site-packages" / suffix
+        if relative_name.startswith("Scripts/"):
+            suffix = relative_path.relative_to(Path("Scripts"))
+            return python_root / "Scripts" / suffix
+        return None
+    return install_root / relative_path
+
+
+def write_hydration_markers(install_root: Path, recipe: SourceRecipe) -> None:
+    setup_dir = install_root / "etc" / "setup"
+    setup_dir.mkdir(parents=True, exist_ok=True)
+    for package_name in recipe.package_names:
+        marker_path = setup_dir / f"{package_name}.lst.gz"
+        with gzip.open(marker_path, "wt", encoding="utf-8") as file_handle:
+            file_handle.write(f"hydrated:{recipe.name}\n")
+
+
+def generate_qtifw_overlay(
+    workspace: WorkspaceModel,
+    configuration: BridgeConfiguration,
+    artifacts_root: Path,
+    output_root: Path,
+    selected_names: Iterable[str],
+) -> None:
+    if output_root.exists():
+        shutil.rmtree(output_root)
+    packages_root = output_root / "packages"
+    packages_root.mkdir(parents=True, exist_ok=True)
+    for source_name in sorted(selected_names):
+        recipe = workspace.recipes[source_name]
+        descriptor = configuration.describe(source_name, recipe.package_names)
+        repo_root = artifacts_root / descriptor.repo_name
+        version_text, release_date = read_version_file(repo_root)
+        for component in descriptor.qtifw_components:
+            write_qtifw_component(
+                packages_root=packages_root,
+                component=component,
+                repo_name=descriptor.repo_name,
+                version_text=version_text,
+                release_date=release_date,
+            )
+
+
+def read_version_file(repo_root: Path) -> Tuple[str, str]:
+    version_file = repo_root / "build" / "version.str"
+    lines = version_file.read_text(encoding="utf-8").splitlines()
+    if len(lines) < 2:
+        raise ValueError(f"Malformed version file: {version_file}")
+    release_date = lines[1].split(" ", 1)[0]
+    return lines[0], release_date
+
+
+def write_qtifw_component(
+    packages_root: Path,
+    component: QtIfwComponent,
+    repo_name: str,
+    version_text: str,
+    release_date: str,
+) -> None:
+    component_dir = packages_root / component.component_id
+    meta_dir = component_dir / "meta"
+    data_dir = component_dir / "data"
+    meta_dir.mkdir(parents=True, exist_ok=True)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    (meta_dir / "package.xml").write_text(
+        build_meta_xml(
+            component=component,
+            version_text=version_text,
+            release_date=release_date,
+        ),
+        encoding="utf-8",
+    )
+    (data_dir / "package.xml").write_text(
+        build_data_xml(component=component, repo_name=repo_name),
+        encoding="utf-8",
+    )
+
+
+def build_meta_xml(
+    component: QtIfwComponent,
+    version_text: str,
+    release_date: str,
+) -> str:
+    lines = [
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
+        "<Package>",
+        f"    <DisplayName>{xml_escape(component.display_name)}</DisplayName>",
+        f"    <Description>{xml_escape(component.description)}</Description>",
+        f"    <Name>{xml_escape(component.component_id)}</Name>",
+        f"    <Version>{xml_escape(version_text)}</Version>",
+        f"    <ReleaseDate>{xml_escape(release_date)}</ReleaseDate>",
+    ]
+    if component.default:
+        lines.append("    <Default>true</Default>")
+    if component.dependencies:
+        dependencies = ",".join(component.dependencies)
+        lines.append(
+            f"    <Dependencies>{xml_escape(dependencies)}</Dependencies>"
+        )
+    if component.replaces:
+        replaces = ",".join(component.replaces)
+        lines.append(f"    <Replaces>{xml_escape(replaces)}</Replaces>")
+    if component.update_text:
+        lines.append(
+            f"    <UpdateText>{xml_escape(component.update_text)}</UpdateText>"
+        )
+    lines.append("</Package>")
+    return "\n".join(lines) + "\n"
+
+
+def build_data_xml(component: QtIfwComponent, repo_name: str) -> str:
+    lines = [
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
+        f"<Package root=\"{xml_escape(repo_name)}\">",
+        "    <win>",
+    ]
+    for copy_rule in component.copy_rules:
+        lines.append(
+            "        <path "
+            f"src=\"{xml_escape(copy_rule.source)}\" "
+            f"dst=\"{xml_escape(copy_rule.destination)}\"/>"
+        )
+    lines.extend(["    </win>", "</Package>"])
+    return "\n".join(lines) + "\n"
+
+
+def xml_escape(value: str) -> str:
+    return (
+        value.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&apos;")
+    )
+
+
+def build_environment(args: argparse.Namespace) -> Dict[str, str]:
+    environment: Dict[str, str] = {}
+    if not args.build_reverse_dependencies:
+        environment["OSGEO4W_BUILD_RDEPS"] = "0"
+    if args.continue_on_error:
+        environment["OSGEO4W_CONTINUE_BUILD"] = "1"
+    if args.osgeo4w_repo:
+        environment["OSGEO4W_REP"] = str(args.osgeo4w_repo)
+    return environment
+
+
+def ensure_osgeo4w_root(root_dir: Path) -> Path:
+    osgeo4w_root = root_dir / "osgeo4w"
+    osgeo4w_root.mkdir(parents=True, exist_ok=True)
+    return osgeo4w_root
+
+
+def build_command(args: argparse.Namespace) -> int:
+    root_dir = args.root.resolve()
+    configuration = BridgeConfiguration.load(args.config.resolve())
+    workspace = WorkspaceModel.discover(root_dir)
+    disabled = {workspace.resolve_source_name(name) for name in args.disable}
+    requested_names = resolve_requested_packages(
+        args=args,
+        root_dir=root_dir,
+        workspace=workspace,
+        configuration=configuration,
+    )
+    build_targets = workspace.build_targets(
+        names=requested_names,
+        include_reverse_dependencies=args.build_reverse_dependencies,
+        disabled=disabled,
+    )
+    environment = build_environment(args)
+    if args.repka_root and not args.ignore_repka:
+        bootstrap_names = workspace.bootstrap_sources(
+            target_names=build_targets,
+            disabled=disabled,
+        )
+        osgeo4w_root = ensure_osgeo4w_root(root_dir)
+        for source_name in bootstrap_names:
+            hydrate_source_recipe(
+                recipe=workspace.recipes[source_name],
+                configuration=configuration,
+                artifacts_root=args.repka_root,
+                install_root=osgeo4w_root,
+            )
+        environment["OSGEO4W_SKIP_UPDATE"] = "1"
+        environment["OSGEO4W_SKIP_MASTER_REPO"] = "1"
+    build_arguments = build_targets + [f"{name}-" for name in sorted(disabled)]
+    if build_arguments:
+        run_command(
+            ["bash", "scripts/build.sh", *build_arguments],
+            cwd=root_dir,
+            environment=environment,
+        )
+    if args.snapshot_output:
+        snapshot = workspace.snapshot(configuration)
+        write_snapshot_file(snapshot, args.snapshot_output.resolve())
+    if args.packaging_backend in {"borsch", "both"}:
+        compiler_tag = args.compiler_tag or detect_compiler_tag()
+        package_selected_sources(
+            workspace=workspace,
+            configuration=configuration,
+            release_root=args.release_root.resolve(),
+            artifacts_root=args.artifacts_root.resolve(),
+            source_names=build_targets,
+            compiler_tag=compiler_tag,
+        )
+        if args.qtifw_output:
+            generate_qtifw_overlay(
+                workspace=workspace,
+                configuration=configuration,
+                artifacts_root=args.artifacts_root.resolve(),
+                output_root=args.qtifw_output.resolve(),
+                selected_names=build_targets,
+            )
+    if args.packaging_backend in {"msi", "both"}:
+        package_msi(
+            root_dir=root_dir,
+            workspace=workspace,
+            selected_names=build_targets,
+            mirror=args.msi_mirror,
+        )
+    return 0
+
+
+def package_selected_sources(
+    workspace: WorkspaceModel,
+    configuration: BridgeConfiguration,
+    release_root: Path,
+    artifacts_root: Path,
+    source_names: Iterable[str],
+    compiler_tag: str,
+) -> None:
+    for source_name in sorted(source_names):
+        recipe = workspace.recipes[source_name]
+        package_source_recipe(
+            recipe=recipe,
+            configuration=configuration,
+            release_root=release_root,
+            artifacts_root=artifacts_root,
+            compiler_tag=compiler_tag,
+        )
+
+
+def package_msi(
+    root_dir: Path,
+    workspace: WorkspaceModel,
+    selected_names: Iterable[str],
+    mirror: str,
+) -> None:
+    msi_sources = []
+    for source_name in selected_names:
+        recipe = workspace.recipes[source_name]
+        if (
+            f"{source_name}-full" in recipe.package_names
+            and f"{source_name}-full-grids" in recipe.package_names
+        ):
+            msi_sources.append(source_name)
+    if not msi_sources:
+        return
+    environment = os.environ.copy()
+    environment["PKGS"] = " ".join(sorted(msi_sources))
+    if mirror:
+        environment["mirror"] = mirror
+    subprocess.run(
+        ["bash", "scripts/msis.sh"],
+        cwd=str(root_dir),
+        env=environment,
+        text=True,
+        check=True,
+    )
+
+
+def resolve_requested_packages(
+    args: argparse.Namespace,
+    root_dir: Path,
+    workspace: WorkspaceModel,
+    configuration: BridgeConfiguration,
+) -> List[str]:
+    if args.changed_since_tag:
+        changed_names = changed_packages_since_tag(
+            root_dir=root_dir,
+            workspace=workspace,
+            configuration=configuration,
+            tag_name=args.changed_since_tag,
+        )
+        if args.packages:
+            requested = {
+                workspace.resolve_source_name(name) for name in args.packages
+            }
+            return sorted(requested.intersection(changed_names))
+        return changed_names
+    if args.packages:
+        return sorted({workspace.resolve_source_name(name) for name in args.packages})
+    return workspace.source_names()
+
+
+def snapshot_command(args: argparse.Namespace) -> int:
+    root_dir = args.root.resolve()
+    configuration = BridgeConfiguration.load(args.config.resolve())
+    workspace = WorkspaceModel.discover(root_dir)
+    snapshot = workspace.snapshot(configuration)
+    write_snapshot_file(snapshot, args.output.resolve())
+    return 0
+
+
+def changes_command(args: argparse.Namespace) -> int:
+    root_dir = args.root.resolve()
+    configuration = BridgeConfiguration.load(args.config.resolve())
+    workspace = WorkspaceModel.discover(root_dir)
+    changed_names = changed_packages_since_tag(
+        root_dir=root_dir,
+        workspace=workspace,
+        configuration=configuration,
+        tag_name=args.tag,
+    )
+    if args.output_format == "json":
+        print(json.dumps(changed_names, indent=2))
+    else:
+        for source_name in changed_names:
+            print(source_name)
+    return 0
+
+
+def package_command(args: argparse.Namespace) -> int:
+    root_dir = args.root.resolve()
+    configuration = BridgeConfiguration.load(args.config.resolve())
+    workspace = WorkspaceModel.discover(root_dir)
+    if args.packages:
+        source_names = sorted(
+            {workspace.resolve_source_name(name) for name in args.packages}
+        )
+    else:
+        source_names = workspace.source_names()
+    compiler_tag = args.compiler_tag or detect_compiler_tag()
+    package_selected_sources(
+        workspace=workspace,
+        configuration=configuration,
+        release_root=args.release_root.resolve(),
+        artifacts_root=args.artifacts_root.resolve(),
+        source_names=source_names,
+        compiler_tag=compiler_tag,
+    )
+    return 0
+
+
+def qtifw_command(args: argparse.Namespace) -> int:
+    root_dir = args.root.resolve()
+    configuration = BridgeConfiguration.load(args.config.resolve())
+    workspace = WorkspaceModel.discover(root_dir)
+    if args.packages:
+        source_names = {
+            workspace.resolve_source_name(name) for name in args.packages
+        }
+    else:
+        source_names = {
+            recipe.name
+            for recipe in workspace.recipes.values()
+            if (
+                args.artifacts_root
+                / configuration.describe(recipe.name, recipe.package_names).repo_name
+            ).exists()
+        }
+    generate_qtifw_overlay(
+        workspace=workspace,
+        configuration=configuration,
+        artifacts_root=args.artifacts_root.resolve(),
+        output_root=args.output.resolve(),
+        selected_names=sorted(source_names),
+    )
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="NextGIS bridge orchestration for OSGeo4W, repka and QtIFW."
+    )
+    parser.add_argument(
+        "--root",
+        type=Path,
+        default=Path.cwd(),
+        help="Repository root.",
+    )
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=Path("nextgis/config/repositories.json"),
+        help="Path to NextGIS bridge configuration.",
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    snapshot_parser = subparsers.add_parser("snapshot", help="Write build snapshot.")
+    snapshot_parser.add_argument(
+        "--output",
+        type=Path,
+        required=True,
+        help="Snapshot file path.",
+    )
+    snapshot_parser.set_defaults(handler=snapshot_command)
+
+    changes_parser = subparsers.add_parser(
+        "changes",
+        help="List changed packages since a git tag.",
+    )
+    changes_parser.add_argument("--tag", required=True, help="Git tag name.")
+    changes_parser.add_argument(
+        "--output-format",
+        choices=["text", "json"],
+        default="text",
+        help="Output format.",
+    )
+    changes_parser.set_defaults(handler=changes_command)
+
+    package_parser = subparsers.add_parser(
+        "package",
+        help="Convert OSGeo4W artifacts into repka-compatible packages.",
+    )
+    package_parser.add_argument(
+        "packages",
+        nargs="*",
+        help="Source package names or binary package names.",
+    )
+    package_parser.add_argument(
+        "--release-root",
+        type=Path,
+        default=Path("x86_64/release"),
+        help="OSGeo4W release root.",
+    )
+    package_parser.add_argument(
+        "--artifacts-root",
+        type=Path,
+        required=True,
+        help="Output root for repka-compatible repositories.",
+    )
+    package_parser.add_argument(
+        "--compiler-tag",
+        default="",
+        help="Explicit compiler tag used in archive names.",
+    )
+    package_parser.set_defaults(handler=package_command)
+
+    qtifw_parser = subparsers.add_parser(
+        "qtifw",
+        help="Generate QtIFW package metadata overlay.",
+    )
+    qtifw_parser.add_argument(
+        "packages",
+        nargs="*",
+        help="Source package names or binary package names.",
+    )
+    qtifw_parser.add_argument(
+        "--artifacts-root",
+        type=Path,
+        required=True,
+        help="Repka-compatible artifacts root.",
+    )
+    qtifw_parser.add_argument(
+        "--output",
+        type=Path,
+        required=True,
+        help="Output directory for generated QtIFW overlay.",
+    )
+    qtifw_parser.set_defaults(handler=qtifw_command)
+
+    build_parser_obj = subparsers.add_parser(
+        "build",
+        help="Build packages and optionally package them for repka or MSI.",
+    )
+    build_parser_obj.add_argument(
+        "packages",
+        nargs="*",
+        help="Source package names or binary package names.",
+    )
+    build_parser_obj.add_argument(
+        "--disable",
+        action="append",
+        default=[],
+        help="Disable a source recipe or binary package from the build graph.",
+    )
+    build_parser_obj.add_argument(
+        "--changed-since-tag",
+        default="",
+        help="Build only packages changed since the provided tag.",
+    )
+    build_parser_obj.add_argument(
+        "--build-reverse-dependencies",
+        action="store_true",
+        help="Build reverse dependencies of selected packages.",
+    )
+    build_parser_obj.add_argument(
+        "--continue-on-error",
+        action="store_true",
+        help="Continue the build if a package fails.",
+    )
+    build_parser_obj.add_argument(
+        "--release-root",
+        type=Path,
+        default=Path("x86_64/release"),
+        help="OSGeo4W release root.",
+    )
+    build_parser_obj.add_argument(
+        "--artifacts-root",
+        type=Path,
+        default=Path("nextgis/artifacts"),
+        help="Output root for repka-compatible repositories.",
+    )
+    build_parser_obj.add_argument(
+        "--qtifw-output",
+        type=Path,
+        help="Output directory for generated QtIFW overlay.",
+    )
+    build_parser_obj.add_argument(
+        "--snapshot-output",
+        type=Path,
+        help="Write a build snapshot after the build.",
+    )
+    build_parser_obj.add_argument(
+        "--packaging-backend",
+        choices=["none", "borsch", "msi", "both"],
+        default="borsch",
+        help="Packaging backend selection.",
+    )
+    build_parser_obj.add_argument(
+        "--repka-root",
+        default="",
+        help="Local path or HTTP root with repka-compatible artifacts.",
+    )
+    build_parser_obj.add_argument(
+        "--ignore-repka",
+        action="store_true",
+        help="Ignore repka artifacts even if repka root is provided.",
+    )
+    build_parser_obj.add_argument(
+        "--compiler-tag",
+        default="",
+        help="Explicit compiler tag used in archive names.",
+    )
+    build_parser_obj.add_argument(
+        "--osgeo4w-repo",
+        type=Path,
+        help="Explicit local OSGeo4W repository path.",
+    )
+    build_parser_obj.add_argument(
+        "--msi-mirror",
+        default="",
+        help="Mirror path or URL passed to scripts/msis.sh.",
+    )
+    build_parser_obj.set_defaults(handler=build_command)
+    return parser
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    return int(args.handler(args))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

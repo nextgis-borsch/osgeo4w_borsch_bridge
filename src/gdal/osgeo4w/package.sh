@@ -4,22 +4,36 @@ export B=next
 export MAINTAINER=JuergenFischer
 export BUILDDEPENDS="python3-core swig zlib-devel proj-devel libpng-devel curl-devel geos-devel libmysql-devel sqlite3-devel netcdf-devel libpq-devel expat-devel xerces-c-devel szip-devel hdf4-devel hdf5-devel hdf5-tools ogdi-devel libiconv-devel openjpeg-devel libspatialite-devel freexl-devel libkml-devel xz-devel zstd-devel msodbcsql-devel poppler-devel libwebp-devel oci-devel openfyba-devel freetype-devel python3-devel python3-numpy libjpeg-turbo-devel python3-setuptools opencl-devel libtiff-devel arrow-cpp-devel lz4-devel openssl-devel lerc-devel kealib-devel odbc-cpp-wrapper-devel libjxl-devel libxml2-devel c-blosc-devel libarchive-devel"
 export PACKAGES="gdal gdal-devel gdal-ecw gdal-filegdb gdal-hana gdal-hdf5 gdal-kea gdal-mrsid gdal-mss gdal-oracle gdal-sosi gdal301-runtime gdal302-runtime gdal303-runtime gdal304-runtime gdal305-runtime gdal306-runtime gdal307-runtime gdal308-runtime gdal309-runtime python3-gdal"
+: ${REPO:=https://github.com/nextgis-borsch/lib_gdal.git}
+: ${REPO_REF:=v$V}
+: ${SOURCE_DIR:=$P-${V%rc*}}
+
+export REPO REPO_REF SOURCE_DIR
 
 source ../../../scripts/build-helpers
 
 startlog
 
-[ -f $P-$V.tar.gz ] || {
-	wget -q http://download.osgeo.org/gdal/${V%rc*}/$P-$V.tar.gz
-	rm -f ../$P-${V%rc*}/patched
-}
+cd ..
 
-[ -d ../$P-$V ] || tar -C .. -xzf $P-$V.tar.gz
-
-if ! [ -f ../$P-${V%rc*}/patched ] && [ -z "$OSGEO4W_SKIP_CLEAN" ]; then
-	patch -p1 -d ../$P-${V%rc*} --dry-run <patch
-	patch -p1 -d ../$P-${V%rc*} <patch >../$P-${V%rc*}/patched
+if [ -d $SOURCE_DIR ]; then
+	cd $SOURCE_DIR
+	git config core.filemode false
+	git fetch origin
+	git clean -f
+	git reset --hard
+	git checkout -f $REPO_REF
+else
+	git clone $REPO --branch $REPO_REF --single-branch --depth 1 $SOURCE_DIR
+	cd $SOURCE_DIR
 fi
+
+if ! [ -f patched ] && [ -z "$OSGEO4W_SKIP_CLEAN" ]; then
+	patch -p1 --dry-run <../osgeo4w/patch
+	patch -p1 <../osgeo4w/patch >patched
+fi
+
+cd ../osgeo4w
 
 #
 # Download MrSID, ECW and filegdb dependencies
@@ -182,7 +196,7 @@ export MRSID_SDK=$(cygpath -am gdaldeps/$MRSID_SDK)
 		-D GDAL_ENABLE_DRIVER_MRSID_PLUGIN=ON -D GDAL_DRIVER_MRSID_PLUGIN_INSTALLATION_MESSAGE="You may enable it by installing the $P-mrsid package." \
 		-D GDAL_ENABLE_DRIVER_HDF5_PLUGIN=ON -D GDAL_DRIVER_HDF5_PLUGIN_INSTALLATION_MESSAGE="You may enable it by installing the $P-hdf5 package." \
 		-D GDAL_ENABLE_DRIVER_KEA_PLUGIN=ON -D GDAL_DRIVER_KEA_PLUGIN_INSTALLATION_MESSAGE="You may enable it by installing the $P-kea package." \
-		../../$P-${V%rc*}
+		../../$SOURCE_DIR
 
 	cmake --build .
 	cmake --build . --target install || cmake --build . --target install
@@ -373,17 +387,17 @@ appendversions $R/$P-kea/setup.hint
 appendversions $R/$P-tiledb/setup.hint
 appendversions $R/$P-hana/setup.hint
 
-cp ../$P-${V%rc*}/LICENSE.TXT $R/$P-$V-$B.txt
-cp ../$P-${V%rc*}/LICENSE.TXT $R/$P-oracle/$P-oracle-$V-$B.txt
-cp ../$P-${V%rc*}/LICENSE.TXT $R/$P$abi-runtime/$P$abi-runtime-$V-$B.txt
-cp ../$P-${V%rc*}/LICENSE.TXT $R/$P-devel/$P-devel-$V-$B.txt
-cp ../$P-${V%rc*}/LICENSE.TXT $R/$P-mss/$P-mss-$V-$B.txt
-cp ../$P-${V%rc*}/LICENSE.TXT $R/$P-sosi/$P-sosi-$V-$B.txt
-cp ../$P-${V%rc*}/LICENSE.TXT $R/$P-hdf5/$P-hdf5-$V-$B.txt
-cp ../$P-${V%rc*}/LICENSE.TXT $R/$P-kea/$P-kea-$V-$B.txt
-cp ../$P-${V%rc*}/LICENSE.TXT $R/$P-tiledb/$P-tiledb-$V-$B.txt
-cp ../$P-${V%rc*}/LICENSE.TXT $R/$P-hana/$P-hana-$V-$B.txt
-cp ../$P-${V%rc*}/LICENSE.TXT $R/python3-$P/python3-$P-$V-$B.txt
+cp ../$SOURCE_DIR/LICENSE.TXT $R/$P-$V-$B.txt
+cp ../$SOURCE_DIR/LICENSE.TXT $R/$P-oracle/$P-oracle-$V-$B.txt
+cp ../$SOURCE_DIR/LICENSE.TXT $R/$P$abi-runtime/$P$abi-runtime-$V-$B.txt
+cp ../$SOURCE_DIR/LICENSE.TXT $R/$P-devel/$P-devel-$V-$B.txt
+cp ../$SOURCE_DIR/LICENSE.TXT $R/$P-mss/$P-mss-$V-$B.txt
+cp ../$SOURCE_DIR/LICENSE.TXT $R/$P-sosi/$P-sosi-$V-$B.txt
+cp ../$SOURCE_DIR/LICENSE.TXT $R/$P-hdf5/$P-hdf5-$V-$B.txt
+cp ../$SOURCE_DIR/LICENSE.TXT $R/$P-kea/$P-kea-$V-$B.txt
+cp ../$SOURCE_DIR/LICENSE.TXT $R/$P-tiledb/$P-tiledb-$V-$B.txt
+cp ../$SOURCE_DIR/LICENSE.TXT $R/$P-hana/$P-hana-$V-$B.txt
+cp ../$SOURCE_DIR/LICENSE.TXT $R/python3-$P/python3-$P-$V-$B.txt
 cp $FGDB_SDK/license/userestrictions.txt $R/$P-filegdb/$P-filegdb-$V-$B.txt
 catdoc $ECW_SDK/\$TEMP/ecwjp2_sdk/Server_Read-Only_EndUser.rtf | sed -e "1,/^[^ ]/ { /^$/d }" >$R/$P-ecw/$P-ecw-$V-$B.txt
 pdftotext -layout -enc ASCII7 $MRSID_SDK/LICENSE.pdf - >$R/$P-mrsid/$P-mrsid-$V-$B.txt

@@ -1,32 +1,48 @@
-export P=qgis-ltr
+: ${P:=qgis-ltr}
+export P
 export V=tbd
 export B=tbd
 export MAINTAINER=JuergenFischer
-export BUILDDEPENDS="expat-devel fcgi-devel proj-devel gdal-devel qt5-oci sqlite3-devel geos-devel gsl-devel libiconv-devel libzip-devel libspatialindex-devel python3-pip python3-pyqt5 python3-sip python3-pyqt-builder python3-devel python3-qscintilla python3-nose2 python3-future python3-pyyaml python3-mock python3-six qca-devel qscintilla-devel qt5-devel qwt-devel libspatialite-devel oci-devel qtkeychain-devel zlib-devel opencl-devel exiv2-devel protobuf-devel python3-setuptools zstd-devel qtwebkit-devel libpq-devel libxml2-devel hdf5-devel hdf5-tools netcdf-devel pdal pdal-devel grass draco-devel python3-oauthlib"
-export PACKAGES="qgis-ltr qgis-ltr-common qgis-ltr-deps qgis-ltr-devel qgis-ltr-full qgis-ltr-full-free qgis-ltr-full-grids qgis-ltr-grass-plugin qgis-ltr-oracle-provider qgis-ltr-pdb qgis-ltr-server"
-
+: ${BUILDDEPENDS:="expat-devel fcgi-devel proj-devel gdal-devel qt5-oci sqlite3-devel geos-devel gsl-devel libiconv-devel libzip-devel libspatialindex-devel python3-pip python3-pyqt5 python3-sip python3-pyqt-builder python3-devel python3-qscintilla python3-nose2 python3-future python3-pyyaml python3-mock python3-six qca-devel qscintilla-devel qt5-devel qwt-devel libspatialite-devel oci-devel qtkeychain-devel zlib-devel opencl-devel exiv2-devel protobuf-devel python3-setuptools zstd-devel qtwebkit-devel libpq-devel libxml2-devel hdf5-devel hdf5-tools netcdf-devel pdal pdal-devel grass draco-devel python3-oauthlib"}
+: ${EXTRA_BUILDDEPENDS:=}
+: ${PACKAGES:="$P $P-common $P-deps $P-devel $P-full $P-full-free $P-full-grids $P-grass-plugin $P-oracle-provider $P-pdb $P-server"}
 : ${REPO:=https://github.com/qgis/QGIS.git}
 : ${SITE:=qgis.org}
 : ${TARGET:=Release}
 : ${CC:=cl.exe}
 : ${CXX:=cl.exe}
 : ${BUILDCONF:=Release}
+: ${CHECKOUT_DIR:=qgis}
+: ${RELBRANCH:=}
+: ${LTRBRANCH:=}
+: ${RELTAG:=}
+: ${EXTRA_CMAKE_ARGS:=}
 
-export SITE TARGET CC CXX BUILDCONF
+if [ -n "$EXTRA_BUILDDEPENDS" ]; then
+	export BUILDDEPENDS="$BUILDDEPENDS $EXTRA_BUILDDEPENDS"
+fi
+export BUILDDEPENDS PACKAGES
+
+export SITE TARGET CC CXX BUILDCONF CHECKOUT_DIR RELBRANCH LTRBRANCH RELTAG EXTRA_CMAKE_ARGS
 
 source ../../../scripts/build-helpers
 
 startlog
 
-# Get latest release branch
-RELBRANCH=$(git ls-remote --heads $REPO "refs/heads/release-*_*" | sed -e '/\^{}$/d' -ne 's#^.*refs/heads/release-#release-#p' | sort -V | tail -1)
-LTRBRANCH=$(git ls-remote --tags $REPO | sed -e '/\^{}$/d' -ne 's#^.*refs/tags/ltr-#release-#p' | fgrep -vx $RELBRANCH | sort -V | tail -1)
-RELTAG=$(git ls-remote --tags $REPO "refs/tags/final-${LTRBRANCH#release-}_*" | sed -e '/\^{}$/d' -ne 's#^.*refs/tags/final-#final-#p' | sort -V | tail -1)
+if [ -z "$RELBRANCH" ]; then
+	RELBRANCH=$(git ls-remote --heads $REPO "refs/heads/release-*_*" | sed -e '/\^{}$/d' -ne 's#^.*refs/heads/release-#release-#p' | sort -V | tail -1)
+fi
+if [ -z "$LTRBRANCH" ]; then
+	LTRBRANCH=$(git ls-remote --tags $REPO | sed -e '/\^{}$/d' -ne 's#^.*refs/tags/ltr-#release-#p' | fgrep -vx $RELBRANCH | sort -V | tail -1)
+fi
+if [ -z "$RELTAG" ]; then
+	RELTAG=$(git ls-remote --tags $REPO "refs/tags/final-${LTRBRANCH#release-}_*" | sed -e '/\^{}$/d' -ne 's#^.*refs/tags/final-#final-#p' | sort -V | tail -1)
+fi
 
 cd ..
 
-if [ -d qgis ]; then
-	cd qgis
+if [ -d $CHECKOUT_DIR ]; then
+	cd $CHECKOUT_DIR
 	git config core.filemode false
 
 	git fetch origin +refs/tags/$RELTAG:refs/tags/$RELTAG
@@ -35,8 +51,8 @@ if [ -d qgis ]; then
 
 	git checkout -f $RELTAG
 else
-	git clone $REPO --branch $RELTAG --single-branch --depth 1 qgis
-	cd qgis
+	git clone $REPO --branch $RELTAG --single-branch --depth 1 $CHECKOUT_DIR
+	cd $CHECKOUT_DIR
 fi
 
 if [ -s ../osgeo4w/patch ]; then
@@ -83,7 +99,7 @@ nextbinary
 	export BUILDNAME=$P-$V-$TARGET-VC17-x86_64
 	export BUILDDIR=$PWD/build
 	export INSTDIR=$PWD/install
-	export SRCDIR=$(cygpath -am ../qgis)
+	export SRCDIR=$(cygpath -am ../$CHECKOUT_DIR)
 	export O4W_ROOT=$(cygpath -am osgeo4w)
 	export LIB_DIR=$(cygpath -aw osgeo4w)
 
@@ -160,6 +176,7 @@ nextbinary
 		-D QSCINTILLA_LIBRARY=$(cygpath -am $O4W_ROOT/apps/Qt5/lib/qscintilla2.lib) \
 		-D DART_TESTING_TIMEOUT=60 \
 		-D PUSH_TO_CDASH=TRUE \
+		$EXTRA_CMAKE_ARGS \
 		$(cygpath -m $SRCDIR)
 
 	mkdir -p $BUILDDIR/apps/$P/pdb
@@ -260,7 +277,7 @@ requires: msvcrt2019 $RUNTIMEDEPENDS libpq geos zstd gsl gdal libspatialite zlib
 external-source: $P
 EOF
 
-	cp ../qgis/COPYING $P-common-$V-$B.txt
+	cp ../$CHECKOUT_DIR/COPYING $P-common-$V-$B.txt
 	/bin/tar -C install -cjf $R/$P-common/$P-common-$V-$B.tar.bz2 \
 		--exclude-from exclude \
 		--exclude "*.pyc" \
@@ -324,7 +341,7 @@ requires: $P-common fcgi
 external-source: $P
 EOF
 
-	cp ../qgis/COPYING $P-server-$V-$B.txt
+	cp ../$CHECKOUT_DIR/COPYING $P-server-$V-$B.txt
 	/bin/tar -C install -cjf $R/$P-server/$P-server-$V-$B.tar.bz2 \
 		--exclude-from exclude \
 		--exclude "*.pyc" \
@@ -347,7 +364,7 @@ category: Desktop
 requires: $P-common
 EOF
 
-	cp ../qgis/COPYING $R/$P-$V-$B.txt
+	cp ../$CHECKOUT_DIR/COPYING $R/$P-$V-$B.txt
 	/bin/tar -C install -cjf $R/$P-$V-$B.tar.bz2 \
 		--exclude-from exclude \
 	        apps/$P/i18n/ \
@@ -388,7 +405,7 @@ requires: $P
 external-source: $P
 EOF
 
-	cp ../qgis/COPYING $R/$P-pdb/$P-pdb-$V-$B.txt
+	cp ../$CHECKOUT_DIR/COPYING $R/$P-pdb/$P-pdb-$V-$B.txt
 	/bin/tar -C build -cjf $R/$P-pdb/$P-pdb-$V-$B.tar.bz2 \
 		apps/$P/pdb
 
@@ -401,7 +418,7 @@ requires: $P grass
 external-source: $P
 EOF
 
-	cp ../qgis/COPYING $R/$P-grass-plugin/$P-grass-plugin-$V-$B.txt
+	cp ../$CHECKOUT_DIR/COPYING $R/$P-grass-plugin/$P-grass-plugin-$V-$B.txt
 	/bin/tar -C install -cjf $R/$P-grass-plugin/$P-grass-plugin-$V-$B.tar.bz2 \
 		--exclude-from exclude \
 		--exclude "*.pyc" \
@@ -422,7 +439,7 @@ requires: $P oci
 external-source: $P
 EOF
 
-	cp ../qgis/COPYING $R/$P-oracle-provider/$P-oracle-provider-$V-$B.txt
+	cp ../$CHECKOUT_DIR/COPYING $R/$P-oracle-provider/$P-oracle-provider-$V-$B.txt
 	/bin/tar -C install -cjf $R/$P-oracle-provider/$P-oracle-provider-$V-$B.tar.bz2 \
 		apps/$P/plugins/provider_oracle.dll \
 		apps/$P/qtplugins/sqldrivers/qsqlocispatial.dll
@@ -436,7 +453,7 @@ requires: $P-common oci
 external-source: $P
 EOF
 
-	cp ../qgis/COPYING $R/$P-devel/$P-devel-$V-$B.txt
+	cp ../$CHECKOUT_DIR/COPYING $R/$P-devel/$P-devel-$V-$B.txt
 	/bin/tar -C install -cjf $R/$P-devel/$P-devel-$V-$B.tar.bz2 \
 		--exclude-from exclude \
 		--exclude "*.pyc" \
@@ -484,13 +501,13 @@ external-source: $P
 EOF
 
 	d=$(mktemp -d)
-	cp ../qgis/COPYING $R/$P-full-free/$P-full-free-$V-$B.txt
+	cp ../$CHECKOUT_DIR/COPYING $R/$P-full-free/$P-full-free-$V-$B.txt
 	/bin/tar -C $d -cjf $R/$P-full-free/$P-full-free-$V-$B.tar.bz2 .
-	cp ../qgis/COPYING $R/$P-full/$P-full-$V-$B.txt
+	cp ../$CHECKOUT_DIR/COPYING $R/$P-full/$P-full-$V-$B.txt
 	/bin/tar -C $d -cjf $R/$P-full/$P-full-$V-$B.tar.bz2 .
-	cp ../qgis/COPYING $R/$P-full-grids/$P-full-grids-$V-$B.txt
+	cp ../$CHECKOUT_DIR/COPYING $R/$P-full-grids/$P-full-grids-$V-$B.txt
 	/bin/tar -C $d -cjf $R/$P-full-grids/$P-full-grids-$V-$B.tar.bz2 .
-	cp ../qgis/COPYING $R/$P-deps/$P-deps-$V-$B.txt
+	cp ../$CHECKOUT_DIR/COPYING $R/$P-deps/$P-deps-$V-$B.txt
 	/bin/tar -C $d -cjf $R/$P-deps/$P-deps-$V-$B.tar.bz2 .
 	rmdir $d
 

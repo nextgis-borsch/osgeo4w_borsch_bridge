@@ -1,0 +1,266 @@
+{
+  "defaults": {
+    "python_root": "apps/Python312",
+    "repository_prefix_exceptions": [
+      "nextgisqgis",
+      "qgis",
+      "qgis-ltr",
+      "qgis-dev"
+    ],
+    "canonical_aliases": {
+      "archive": "archive",
+      "iconv": "iconv",
+      "jpeg_turbo": "jpeg",
+      "mysql": "mysql",
+      "pq": "pq",
+      "png": "png",
+      "sentrynative": "sentrynative",
+      "spatialindex": "spatialindex",
+      "spatialite": "spatialite",
+      "tiff": "tiff",
+      "xml2": "xml2",
+      "xslt": "xslt",
+      "zip": "zip"
+    }
+  },
+  "repositories": {
+    "gdal": {
+      "repo_name": "lib_gdal",
+      "packet_name": "gdal",
+      "packaging_class": "osgeo4w-merge",
+      "qtifw_components": [
+        {
+          "id": "com.nextgis.spatial.gdal",
+          "display_name": "GDAL",
+          "description": "GDAL libraries and plugins",
+          "replaces": [
+            "com.nextgis.spatial.gdal.sxf"
+          ],
+          "copy_rules": [
+            {
+              "src": "bin/*.dll",
+              "dst": "bin"
+            },
+            {
+              "src": "apps/gdal/**",
+              "dst": "apps/gdal"
+            },
+            {
+              "src": "share/gdal/**",
+              "dst": "share/gdal"
+            },
+            {
+              "src": "etc/ini/gdal.bat",
+              "dst": "etc/ini"
+            }
+          ]
+        },
+        {
+          "id": "com.nextgis.python.gdal",
+          "display_name": "PyGDAL",
+          "description": "GDAL Python bindings",
+          "dependencies": [
+            "com.nextgis.spatial.gdal"
+          ],
+          "copy_rules": [
+            {
+              "src": "apps/Python*/Lib/site-packages/GDAL/**",
+              "dst": "apps/Python312/Lib/site-packages/GDAL"
+            },
+            {
+              "src": "apps/Python*/Lib/site-packages/osgeo/**",
+              "dst": "apps/Python312/Lib/site-packages/osgeo"
+            },
+            {
+              "src": "apps/Python*/Lib/site-packages/python3-gdal.pth",
+              "dst": "apps/Python312/Lib/site-packages"
+            },
+            {
+              "src": "apps/Python*/Scripts/**",
+              "dst": "apps/Python312/Scripts"
+            }
+          ]
+        },
+        {
+          "id": "com.nextgis.utils.gdal",
+          "display_name": "GDAL Utilities",
+          "description": "GDAL command line tools",
+          "dependencies": [
+            "com.nextgis.spatial.gdal",
+            "com.nextgis.python.gdal"
+          ],
+          "copy_rules": [
+            {
+              "src": "bin/*.exe",
+              "dst": "bin"
+            },
+            {
+              "src": "bin/*.bat",
+              "dst": "bin"
+            }
+          ]
+        }
+      ]
+    },
+    "openjpeg": {
+      "repo_name": "lib_openjpeg",
+      "packet_name": "openjpeg",
+      "packaging_class": "osgeo4w-merge",
+      "qtifw_components": [
+        {
+          "id": "com.nextgis.common.openjpeg",
+          "display_name": "OpenJPEG",
+          "description": "OpenJPEG runtime library",
+          "copy_rules": [
+            {
+              "src": "bin/*.dll",
+              "dst": "bin"
+            }
+          ]
+        }
+      ]
+    },
+    "python3-matplotlib": {
+      "repo_name": "py_matplotlib",
+      "packet_name": "matplotlib",
+      "packaging_class": "python-site-package",
+      "qtifw_components": [
+        {
+          "id": "com.nextgis.python.matplotlib",
+          "display_name": "matplotlib",
+          "description": "matplotlib Python package",
+          "copy_rules": [
+            {
+              "src": "Lib/site-packages/**",
+              "dst": "apps/Python312/Lib/site-packages"
+            },
+            {
+              "src": "Scripts/**",
+              "dst": "apps/Python312/Scripts"
+            }
+          ]
+        }
+      ]
+    },
+    "nextgisqgis": {
+      "repo_name": "nextgisqgis",
+      "packet_name": "nextgisqgis",
+      "packaging_class": "osgeo4w-merge",
+      "qtifw_components": [
+        {
+          "id": "com.nextgis.qgis",
+          "display_name": "QGIS",
+          "description": "NextGIS QGIS application",
+          "default": true,
+          "dependencies": [
+            "com.nextgis.nextgis_updater"
+          ],
+          "replaces": [
+            "com.nextgis.qgis.main",
+            "com.nextgis.qgis.lib3d",
+            "com.nextgis.qgis.libanalysis",
+            "com.nextgis.qgis.libapp",
+            "com.nextgis.qgis.libcore",
+            "com.nextgis.qgis.libgui",
+            "com.nextgis.qgis.libnative",
+            "com.nextgis.qgis.libpython",
+            "com.nextgis.qgis.plugins",
+            "com.nextgis.qgis.python",
+            "com.nextgis.qgis.doc",
+            "com.nextgis.qgis.doc.en",
+            "com.nextgis.qgis.doc.ru"
+          ],
+          "copy_rules": [
+            {
+              "src": "bin/*.dll",
+              "dst": "bin"
+            },
+            {
+              "src": "bin/*.exe",
+              "dst": "bin"
+            },
+            {
+              "src": "apps/nextgisqgis/**",
+              "dst": "apps/nextgisqgis"
+            },
+            {
+              "src": "httpd.d/**",
+              "dst": "httpd.d"
+            },
+            {
+              "src": "share/doc/nextgisqgis/**",
+              "dst": "share/doc/nextgisqgis"
+            }
+          ]
+        }
+      ]
+    },
+    "ngstd": {
+      "repo_name": "lib_ngstd",
+      "packet_name": "ngstd",
+      "packaging_class": "osgeo4w-merge",
+      "qtifw_components": [
+        {
+          "id": "com.nextgis.common.ngstd",
+          "display_name": "NextGIS STD",
+          "description": "NextGIS Standard Qt5 library",
+          "dependencies": [
+            "com.nextgis.common.qt.qt5",
+            "com.nextgis.spatial.gdal",
+            "com.nextgis.common.sentry"
+          ],
+          "copy_rules": [
+            {
+              "src": "bin/*.dll",
+              "dst": "bin"
+            },
+            {
+              "src": "share/translations/ngstd*.qm",
+              "dst": "share/translations"
+            }
+          ]
+        },
+        {
+          "id": "com.nextgis.python.ngstd",
+          "display_name": "PyNGSTD",
+          "description": "NextGIS STD Python bindings",
+          "dependencies": [
+            "com.nextgis.common.ngstd"
+          ],
+          "copy_rules": [
+            {
+              "src": "Lib/site-packages/**",
+              "dst": "apps/Python312/Lib/site-packages"
+            },
+            {
+              "src": "Scripts/**",
+              "dst": "apps/Python312/Scripts"
+            }
+          ]
+        }
+      ]
+    },
+    "sentrynative": {
+      "repo_name": "lib_sentrynative",
+      "packet_name": "sentrynative",
+      "packaging_class": "osgeo4w-merge",
+      "qtifw_components": [
+        {
+          "id": "com.nextgis.common.sentry",
+          "display_name": "SENTRY",
+          "description": "Sentry native runtime",
+          "copy_rules": [
+            {
+              "src": "bin/*.dll",
+              "dst": "bin"
+            },
+            {
+              "src": "bin/*.exe",
+              "dst": "bin"
+            }
+          ]
+        }
+      ]
+    }
+  }
+}
