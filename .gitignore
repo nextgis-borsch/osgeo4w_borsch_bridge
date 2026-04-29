@@ -229,3 +229,5 @@ tmp/
 package.log.*
 scripts/vs2019
 scripts/vs2022
+
+src/*/*-[0-9]*/
