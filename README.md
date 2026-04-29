@@ -83,10 +83,12 @@ python3 scripts/borsch.py package \
 Generate QtIFW overlay metadata from the repacked repositories:
 
 ```bash
-python3 scripts/borsch.py qtifw \
-  --artifacts-root nextgis/artifacts \
-  --output nextgis/qtifw
+python3 scripts/borsch.py qtifw
 ```
+
+By default, the command reads OSGeo4W metadata from `x86_64/release`, uses
+`nextgis/artifacts` as the repacked repository root and writes the generated
+overlay into `nextgis/qtifw`.
 
 Build selected packages, hydrate dependencies from repka when the exact recipe
 version is available, rebuild missing or outdated dependencies from source,

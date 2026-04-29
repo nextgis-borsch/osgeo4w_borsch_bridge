@@ -19,7 +19,7 @@ import threading
 import time
 import zipfile
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from queue import Empty, Queue
@@ -74,6 +74,13 @@ class SourceRecipe:
 class BuildSnapshot:
     config_digest: str
     packages: Dict[str, Dict[str, object]]
+
+
+@dataclass
+class QtIfwPackageMetadata:
+    display_name: str = ""
+    description: str = ""
+    license_files: List[Path] = field(default_factory=list)
 
 
 class WorkspaceModel:
@@ -1461,6 +1468,7 @@ def resolve_planned_dependency_sources(
 def generate_qtifw_overlay(
     workspace: WorkspaceModel,
     configuration: BridgeConfiguration,
+    release_root: Path,
     artifacts_root: Path,
     output_root: Path,
     selected_names: Iterable[str],
@@ -1476,12 +1484,21 @@ def generate_qtifw_overlay(
         repo_root = artifacts_root / descriptor.repo_name
         version_text, release_date = read_version_file(repo_root)
         for component in descriptor.qtifw_components:
+            package_metadata = load_qtifw_package_metadata(
+                release_root=release_root,
+                package_name=(
+                    component.metadata_package
+                    or preferred_metadata_package_name(recipe.package_names)
+                ),
+                version_text=version_text,
+            )
             write_qtifw_component(
                 packages_root=packages_root,
                 component=component,
                 repo_name=descriptor.repo_name,
                 version_text=version_text,
                 release_date=release_date,
+                package_metadata=package_metadata,
             )
 
 
@@ -1494,23 +1511,163 @@ def read_version_file(repo_root: Path) -> Tuple[str, str]:
     return lines[0], release_date
 
 
+def preferred_metadata_package_name(package_names: Sequence[str]) -> str:
+    runtime_packages, _devel_packages = split_devel_packages(package_names)
+    if runtime_packages:
+        return runtime_packages[0]
+    if package_names:
+        return package_names[0]
+    return ""
+
+
+def parse_setup_hint_text(text: str) -> Dict[str, str]:
+    values: Dict[str, str] = {}
+    current_key = ""
+    current_lines: List[str] = []
+    for raw_line in text.splitlines():
+        line = raw_line.rstrip()
+        if current_key:
+            current_lines.append(line)
+            if line.endswith('"'):
+                values[current_key] = normalize_setup_hint_value(
+                    "\n".join(current_lines)
+                )
+                current_key = ""
+                current_lines = []
+            continue
+        stripped_line = line.strip()
+        if not stripped_line or stripped_line.startswith("#"):
+            continue
+        if ":" not in line:
+            continue
+        key, raw_value = line.split(":", 1)
+        value = raw_value.strip()
+        if value.startswith('"') and not value.endswith('"'):
+            current_key = key.strip()
+            current_lines = [value]
+            continue
+        values[key.strip()] = normalize_setup_hint_value(value)
+    if current_key:
+        values[current_key] = normalize_setup_hint_value("\n".join(current_lines))
+    return values
+
+
+def normalize_setup_hint_value(value: str) -> str:
+    stripped_value = value.strip()
+    if (
+        len(stripped_value) >= 2
+        and stripped_value.startswith('"')
+        and stripped_value.endswith('"')
+    ):
+        stripped_value = stripped_value[1:-1]
+    return re.sub(r"\s+", " ", stripped_value).strip()
+
+
+def find_qtifw_license_files(
+    release_root: Path,
+    package_name: str,
+    version_text: str,
+) -> List[Path]:
+    if not package_name:
+        return []
+    package_root = release_root / package_name
+    if not package_root.exists():
+        return []
+    patterns = [
+        f"{package_name}-{version_text}-*.txt",
+        f"{package_name}-{version_text}-*.rtf",
+        f"{package_name}-{version_text}-*.pdf",
+        f"{package_name}-*.txt",
+        f"{package_name}-*.rtf",
+        f"{package_name}-*.pdf",
+    ]
+    license_files: List[Path] = []
+    seen_paths: Set[Path] = set()
+    for pattern in patterns:
+        for license_path in sorted(package_root.glob(pattern)):
+            if not license_path.is_file() or license_path in seen_paths:
+                continue
+            license_files.append(license_path)
+            seen_paths.add(license_path)
+        if license_files and pattern.endswith(".txt"):
+            break
+    return license_files
+
+
+def load_qtifw_package_metadata(
+    release_root: Path,
+    package_name: str,
+    version_text: str,
+) -> QtIfwPackageMetadata:
+    if not package_name:
+        return QtIfwPackageMetadata()
+    hint_path = release_root / package_name / "setup.hint"
+    hint_values: Dict[str, str] = {}
+    if hint_path.exists():
+        hint_values = parse_setup_hint_text(hint_path.read_text(encoding="utf-8"))
+    return QtIfwPackageMetadata(
+        display_name=hint_values.get("sdesc", ""),
+        description=hint_values.get("ldesc", ""),
+        license_files=find_qtifw_license_files(
+            release_root=release_root,
+            package_name=package_name,
+            version_text=version_text,
+        ),
+    )
+
+
+def stage_qtifw_license_files(
+    meta_dir: Path,
+    component: QtIfwComponent,
+    package_metadata: QtIfwPackageMetadata,
+) -> List[Tuple[str, str]]:
+    license_entries: List[Tuple[str, str]] = []
+    used_names: Set[str] = set()
+    for index, license_path in enumerate(package_metadata.license_files, start=1):
+        target_name = license_path.name
+        if target_name in used_names:
+            target_name = f"{license_path.stem}-{index}{license_path.suffix}"
+        shutil.copy2(license_path, meta_dir / target_name)
+        used_names.add(target_name)
+        license_name = f"{component.component_id} license"
+        if len(package_metadata.license_files) > 1:
+            license_name = f"{license_name} {index}"
+        license_entries.append((license_name, target_name))
+    return license_entries
+
+
 def write_qtifw_component(
     packages_root: Path,
     component: QtIfwComponent,
     repo_name: str,
     version_text: str,
     release_date: str,
+    package_metadata: QtIfwPackageMetadata,
 ) -> None:
     component_dir = packages_root / component.component_id
     meta_dir = component_dir / "meta"
     data_dir = component_dir / "data"
     meta_dir.mkdir(parents=True, exist_ok=True)
     data_dir.mkdir(parents=True, exist_ok=True)
+    display_name = component.display_name
+    description = component.description
+    if component.use_hint_metadata and package_metadata.display_name:
+        display_name = package_metadata.display_name
+    if component.use_hint_metadata and package_metadata.description:
+        description = package_metadata.description
+    license_entries = stage_qtifw_license_files(
+        meta_dir=meta_dir,
+        component=component,
+        package_metadata=package_metadata,
+    )
     (meta_dir / "package.xml").write_text(
         build_meta_xml(
             component=component,
+            display_name=display_name,
+            description=description,
             version_text=version_text,
             release_date=release_date,
+            license_entries=license_entries,
         ),
         encoding="utf-8",
     )
@@ -1522,14 +1679,17 @@ def write_qtifw_component(
 
 def build_meta_xml(
     component: QtIfwComponent,
+    display_name: str,
+    description: str,
     version_text: str,
     release_date: str,
+    license_entries: Sequence[Tuple[str, str]],
 ) -> str:
     lines = [
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
         "<Package>",
-        f"    <DisplayName>{xml_escape(component.display_name)}</DisplayName>",
-        f"    <Description>{xml_escape(component.description)}</Description>",
+        f"    <DisplayName>{xml_escape(display_name)}</DisplayName>",
+        f"    <Description>{xml_escape(description)}</Description>",
         f"    <Name>{xml_escape(component.component_id)}</Name>",
         f"    <Version>{xml_escape(version_text)}</Version>",
         f"    <ReleaseDate>{xml_escape(release_date)}</ReleaseDate>",
@@ -1548,6 +1708,15 @@ def build_meta_xml(
         lines.append(
             f"    <UpdateText>{xml_escape(component.update_text)}</UpdateText>"
         )
+    if license_entries:
+        lines.append("    <Licenses>")
+        for license_name, license_file in license_entries:
+            lines.append(
+                "        <License "
+                f"name=\"{xml_escape(license_name)}\" "
+                f"file=\"{xml_escape(license_file)}\" />"
+            )
+        lines.append("    </Licenses>")
     lines.append("</Package>")
     return "\n".join(lines) + "\n"
 
@@ -1761,6 +1930,7 @@ def build_command(args: argparse.Namespace) -> int:
             generate_qtifw_overlay(
                 workspace=workspace,
                 configuration=configuration,
+                release_root=effective_release_root,
                 artifacts_root=args.artifacts_root.resolve(),
                 output_root=args.qtifw_output.resolve(),
                 selected_names=build_targets,
@@ -1932,6 +2102,7 @@ def qtifw_command(args: argparse.Namespace) -> int:
     generate_qtifw_overlay(
         workspace=workspace,
         configuration=configuration,
+        release_root=args.release_root.resolve(),
         artifacts_root=args.artifacts_root.resolve(),
         output_root=args.output.resolve(),
         selected_names=sorted(source_names),

@@ -18,8 +18,9 @@ DEFAULT_BOOTSTRAP_DIRNAME = ".nextgis-bootstrap"
 DEFAULT_CYGWIN_MIRROR = "https://mirrors.kernel.org/sourceware/cygwin/"
 DEFAULT_CYGWIN_PACKAGES = (
     "bison,flex,poppler,doxygen,git,unzip,tar,diffutils,patch,curl,wget,"
-    "flip,p7zip,make,osslsigncode,mingw64-x86_64-gcc-core,catdoc,enscript,"
-    "mingw64-x86_64-binutils,perl-Data-UUID,ruby=2.6.4-1,perl-YAML-Tiny"
+    "flip,p7zip,make,nasm,osslsigncode,mingw64-x86_64-gcc-core,catdoc,"
+    "enscript,mingw64-x86_64-binutils,perl,perl-Data-UUID,ruby=2.6.4-1,"
+    "perl-YAML-Tiny"
 )
 DEFAULT_SETUP_URL = "https://cygwin.com/setup-x86_64.exe"
 DOWNLOAD_CHUNK_SIZE = 1024 * 1024

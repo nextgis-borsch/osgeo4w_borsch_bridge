@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import subprocess
 
 from pathlib import Path
 from typing import Optional, Sequence
 
-from .logging_support import configure_logging
+from .logging_support import LOGGER, configure_logging
 from .pipeline import (
     bootstrap_command,
     build_command,
@@ -184,15 +185,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="Source package names or binary package names.",
     )
     qtifw_parser.add_argument(
+        "--release-root",
+        type=Path,
+        default=Path("x86_64/release"),
+        help="OSGeo4W release root used for setup.hint and license metadata.",
+    )
+    qtifw_parser.add_argument(
         "--artifacts-root",
         type=Path,
-        required=True,
+        default=Path("nextgis/artifacts"),
         help="Repka-compatible artifacts root.",
     )
     qtifw_parser.add_argument(
         "--output",
         type=Path,
-        required=True,
+        default=Path("nextgis/qtifw"),
         help="Output directory for generated QtIFW overlay.",
     )
     qtifw_parser.set_defaults(handler=qtifw_command)
@@ -308,4 +315,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     validate_args(parser, args)
     set_active_proxy(args.proxy)
     configure_logging(args)
-    return int(args.handler(args))
+    try:
+        return int(args.handler(args))
+    except KeyboardInterrupt:
+        LOGGER.error("Operation cancelled by user")
+        return 130
+    except subprocess.CalledProcessError as error:
+        command_text = "unknown command"
+        if error.cmd:
+            command_text = " ".join(str(part) for part in error.cmd)
+        LOGGER.error(
+            f"Command failed with exit code {error.returncode}: {command_text}"
+        )
+        return error.returncode or 1
+    except Exception as error:
+        LOGGER.error(str(error))
+        return 1

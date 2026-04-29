@@ -5,8 +5,6 @@ export MAINTAINER=JuergenFischer
 export BUILDDEPENDS=none
 export PACKAGES="ffmpeg ffmpeg-devel"
 
-NASM=2.15.05
-
 source ../../../scripts/build-helpers
 
 startlog
@@ -14,14 +12,15 @@ startlog
 [ -f $P-$V.tar.bz2 ] || wget -q http://ffmpeg.org/releases/$P-$V.tar.bz2
 [ -f ../$P-$V/configure ] || tar -C .. -xjf $P-$V.tar.bz2
 
-if ! [ -d nasm-$NASM ]; then
-        wget -c https://www.nasm.us/pub/nasm/releasebuilds/$NASM/win64/nasm-$NASM-win64.zip
-        unzip nasm-$NASM-win64.zip
+if ! type -p nasm >/dev/null; then
+	log "nasm was not found in PATH; install it via the configured Cygwin runtime"
+	exit 1
 fi
+
+log "Using nasm from $(type -p nasm)"
 
 (
 	set -e
-	export PATH=$PATH:$(cygpath -a nasm-$NASM)
 
 	vsenv
 

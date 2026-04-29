@@ -5,10 +5,6 @@ export MAINTAINER=JuergenFischer
 export BUILDDEPENDS=none
 export PACKAGES="openssl openssl-devel openssl-doc"
 
-# perl also used in libpq and qt5
-SBPERL=5.32.0.1
-NASM=2.15.05
-
 source ../../../scripts/build-helpers
 
 startlog
@@ -19,25 +15,22 @@ startlog
 	rm -f built tested installed
 }
 
-if ! [ -d nasm-$NASM ]; then
-	wget -c https://www.nasm.us/pub/nasm/releasebuilds/$NASM/win64/nasm-$NASM-win64.zip
-	unzip nasm-$NASM-win64.zip
-fi
-
-if ! [ -d perl ]; then
-	wget -c http://strawberryperl.com/download/$SBPERL/strawberry-perl-$SBPERL-64bit-portable.zip
-	mkdir perl
-	cd perl
-	unzip ../strawberry-perl-$SBPERL-64bit-portable.zip
-	cd ..
-fi
-
 vsenv
 
-(
-	fetchenv perl/portableshell.bat /SETENV
-	export PATH=$PATH:$(cygpath -a nasm-$NASM)
+if ! type -p perl >/dev/null; then
+	log "perl was not found in PATH; install it via the configured Cygwin runtime"
+	exit 1
+fi
 
+if ! type -p nasm >/dev/null; then
+	log "nasm was not found in PATH; install it via the configured Cygwin runtime"
+	exit 1
+fi
+
+log "Using perl from $(type -p perl)"
+log "Using nasm from $(type -p nasm)"
+
+(
 	cd ../$P-$V
 
 	if ! [ -f ../osgeo4w/built ]; then

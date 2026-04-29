@@ -5,8 +5,6 @@ export MAINTAINER=JuergenFischer
 export BUILDDEPENDS=zlib-devel
 export PACKAGES="libjpeg-turbo libjpeg-turbo-devel libjpeg-turbo-tools"
 
-NASM=2.15.05
-
 source ../../../scripts/build-helpers
 
 startlog
@@ -14,17 +12,17 @@ startlog
 [ -f $P-$V.tar.gz ] || wget -O $P-$V.tar.gz https://github.com/$P/$P/archive/refs/tags/$V.tar.gz
 [ -f ../$P-$V/CMakeLists.txt ] || tar -C .. -xzf $P-$V.tar.gz
 
-if ! [ -d nasm-$NASM ]; then
-        wget -c https://www.nasm.us/pub/nasm/releasebuilds/$NASM/win64/nasm-$NASM-win64.zip
-        unzip nasm-$NASM-win64.zip
+if ! type -p nasm >/dev/null; then
+	log "nasm was not found in PATH; install it via the configured Cygwin runtime"
+	exit 1
 fi
+
+log "Using nasm from $(type -p nasm)"
 
 (
 	vsenv
 	cmakeenv
 	ninjaenv
-
-	export PATH=$PATH:$(cygpath -a nasm-$NASM)
 
 	rm -rf build install
 	mkdir build install
