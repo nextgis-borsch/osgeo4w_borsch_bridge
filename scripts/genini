@@ -7,6 +7,7 @@
 # for details.
 #
 use File::Basename;
+use Cwd qw/abs_path/;
 use Digest::MD5;
 use Getopt::Long;
 use POSIX;
@@ -63,8 +64,18 @@ my %licfile;
 my %licmap;
 my %acceptable;
 
+my $script_path = abs_path($0) // $0;
+my $script_dir = dirname($script_path);
+my $repo_dir = dirname($script_dir);
+
 unless($alllicenses) {
-    if( open F, "license.map" ) {
+    if( open F, "$repo_dir/license.map" ) {
+        while(<F>) {
+            chomp;
+            my($first,$second,$comment) = split /\s+/;
+            $licmap{$second} = $first;
+        }
+    } elsif( open F, "license.map" ) {
         while(<F>) {
             chomp;
             my($first,$second,$comment) = split /\s+/;
@@ -74,7 +85,13 @@ unless($alllicenses) {
         warn "license.map not found";
     }
 
-    if( open F, "acceptable.lst" ) {
+    if( open F, "$repo_dir/acceptable.lst" ) {
+        while(<F>) {
+            chomp;
+            my($id,$comment) = split /\s+/;
+            $acceptable{$id} = $comment;
+        }
+    } elsif( open F, "acceptable.lst" ) {
         while(<F>) {
             chomp;
             my($id,$comment) = split /\s+/;
