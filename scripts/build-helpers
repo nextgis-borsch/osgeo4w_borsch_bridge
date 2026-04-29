@@ -557,6 +557,29 @@ fetchdeps() {
 		fi
 	fi
 
+	if [ -n "$OSGEO4W_SKIP_MASTER_REPO" ]; then
+		log "Installing missing dependencies from local repository without osgeo4w-setup.exe"
+		for p in $missing; do
+			installlocaldep "$p" || true
+		done
+
+		missing=
+		for p in "$@"; do
+			if [ -f "$OSGEO4W_PWD/osgeo4w/etc/setup/$p.lst.gz" ]; then
+				continue
+			fi
+
+			missing="$missing $p"
+		done
+
+		if [ -z "$missing" ]; then
+			return 0
+		fi
+
+		log "Missing dependencies:$missing"
+		return 1
+	fi
+
 	if ! [ -x "$OSGEO4W_SCRIPTS/osgeo4w-setup.exe" ]; then
 		log "Downloading osgeo4w-setup.exe"
 		curl --output "$OSGEO4W_SCRIPTS/osgeo4w-setup.exe" $MASTER_REPO/osgeo4w-setup.exe
@@ -617,6 +640,40 @@ fetchdeps() {
 	fi
 }
 declare -x fetchdeps
+
+findlocalarchive() {
+	local package_name=$1
+	find "$OSGEO4W_REP/x86_64/release" -type f -name "$package_name-*.tar.bz2" ! -name "*-src.tar.bz2" | sort | tail -n1
+}
+declare -x findlocalarchive
+
+installlocaldep() {
+	local package_name=$1
+	local archive_path
+	local source_dir
+	local marker_path
+
+	archive_path=$(findlocalarchive "$package_name")
+	if [ -z "$archive_path" ]; then
+		log "No local release archive found for $package_name"
+		return 1
+	fi
+
+	source_dir=$(dirname "$archive_path")
+	if [ "${source_dir##*/}" = "$package_name" ]; then
+		source_dir=$(dirname "$source_dir")
+	fi
+
+	log "Installing $package_name from local release archives under $source_dir"
+	while IFS= read -r tarball; do
+		tar -C "$OSGEO4W_PWD/osgeo4w" -xjf "$tarball"
+	done < <(find "$source_dir" -maxdepth 2 -type f -name "*.tar.bz2" ! -name "*-src.tar.bz2" | sort)
+
+	marker_path="$OSGEO4W_PWD/osgeo4w/etc/setup/$package_name.lst.gz"
+	mkdir -p "${marker_path%/*}"
+	printf 'local:%s\n' "$package_name" | gzip -c >"$marker_path"
+}
+declare -x installlocaldep
 
 # determine whether first version argument is higher than seconds
 higherversion() {

@@ -92,6 +92,7 @@ class SourceRecipe:
     package_script: Path
     package_names: List[str]
     build_depends: List[str]
+    package_version: str
 
     @property
     def osgeo4w_dir(self) -> Path:
@@ -241,7 +242,7 @@ def parse_recipe(package_script: Path) -> SourceRecipe:
             if match is None:
                 continue
             name = match.group("name")
-            if name not in {"P", "PACKAGES", "BUILDDEPENDS"}:
+            if name not in {"P", "PACKAGES", "BUILDDEPENDS", "V"}:
                 continue
             value = match.group("value").strip()
             if value.startswith('"') and value.endswith('"'):
@@ -258,6 +259,7 @@ def parse_recipe(package_script: Path) -> SourceRecipe:
         package_script=package_script,
         package_names=split_export(exports.get("PACKAGES", "")),
         build_depends=build_depends,
+        package_version=exports.get("V", ""),
     )
 
 
@@ -832,20 +834,33 @@ def parse_archive_version(package_name: str, archive_name: str) -> str:
 
 
 def locate_archive_base(repo_root: Path) -> str:
+    return locate_archive_bases(repo_root)[0]
+
+
+def locate_archive_bases(repo_root: Path) -> List[str]:
     version_file = repo_root / "build" / "version.str"
     lines = version_file.read_text(encoding="utf-8").splitlines()
     if len(lines) < 3:
         raise ValueError(f"Malformed version.str in {version_file}")
-    return lines[2].strip()
+    archive_bases = [line.strip() for line in lines[2:] if line.strip()]
+    if not archive_bases:
+        raise ValueError(f"No archive base entries found in {version_file}")
+    return archive_bases
 
 
-def write_version_file(repo_root: Path, version: str, archive_base: str) -> None:
+def write_version_file(
+    repo_root: Path,
+    version: str,
+    archive_bases: Sequence[str],
+) -> None:
     build_dir = repo_root / "build"
     build_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     version_file = build_dir / "version.str"
+    payload_lines = [version, timestamp]
+    payload_lines.extend(archive_bases)
     version_file.write_text(
-        f"{version}\n{timestamp}\n{archive_base}",
+        "\n".join(payload_lines),
         encoding="utf-8",
     )
 
@@ -934,6 +949,58 @@ def create_zip_archive(
             zip_handle.write(file_path, archive_path.as_posix())
 
 
+def split_devel_packages(
+    package_names: Sequence[str],
+) -> Tuple[List[str], List[str]]:
+    runtime_packages: List[str] = []
+    devel_packages: List[str] = []
+    for package_name in package_names:
+        if package_name.endswith("-devel"):
+            devel_packages.append(package_name)
+            continue
+        runtime_packages.append(package_name)
+    return runtime_packages, devel_packages
+
+
+def build_archive_bases(
+    packet_name: str,
+    version: str,
+    compiler_tag: str,
+    package_names: Sequence[str],
+) -> List[str]:
+    runtime_packages, devel_packages = split_devel_packages(package_names)
+    if runtime_packages and devel_packages:
+        return [
+            f"{packet_name}-{version}-{compiler_tag}",
+            f"{packet_name}-devel-{version}-{compiler_tag}",
+        ]
+    return [f"{packet_name}-{version}-{compiler_tag}"]
+
+
+def stage_selected_archives(
+    archive_paths: Sequence[Path],
+    configuration: BridgeConfiguration,
+    packaging_class: str,
+    temporary_dir: Path,
+    python_root: str,
+) -> Path:
+    install_root = temporary_dir / "install"
+    stage_root = temporary_dir / "stage"
+    install_root.mkdir(parents=True, exist_ok=True)
+    stage_root.mkdir(parents=True, exist_ok=True)
+    for archive_path in archive_paths:
+        extract_tarball(archive_path, install_root)
+    if packaging_class == "python-site-package":
+        stage_python_site_package(
+            install_root=install_root,
+            stage_root=stage_root,
+            python_root=python_root,
+        )
+    else:
+        stage_osgeo4w_merge(install_root=install_root, stage_root=stage_root)
+    return stage_root
+
+
 def package_source_recipe(
     recipe: SourceRecipe,
     configuration: BridgeConfiguration,
@@ -948,39 +1015,54 @@ def package_source_recipe(
         primary_package,
         archives[primary_package].name,
     )
-    archive_base = f"{descriptor.packet_name}-{version}-{compiler_tag}"
+    archive_bases = build_archive_bases(
+        packet_name=descriptor.packet_name,
+        version=version,
+        compiler_tag=compiler_tag,
+        package_names=recipe.package_names,
+    )
+    runtime_packages, devel_packages = split_devel_packages(recipe.package_names)
+    main_packages = runtime_packages if runtime_packages else recipe.package_names
     repo_root = artifacts_root / descriptor.repo_name
     if repo_root.exists():
         shutil.rmtree(repo_root)
     repo_root.mkdir(parents=True, exist_ok=True)
+    build_dir = repo_root / "build"
+    build_dir.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=f"{recipe.name}-stage-") as temp_name:
         temporary_dir = Path(temp_name)
-        install_root = temporary_dir / "install"
-        stage_root = temporary_dir / "stage"
-        install_root.mkdir(parents=True, exist_ok=True)
-        stage_root.mkdir(parents=True, exist_ok=True)
-        for archive_path in archives.values():
-            extract_tarball(archive_path, install_root)
-        if descriptor.packaging_class == "python-site-package":
-            stage_python_site_package(
-                install_root=install_root,
-                stage_root=stage_root,
+        main_stage_root = stage_selected_archives(
+            archive_paths=[archives[package_name] for package_name in main_packages],
+            configuration=configuration,
+            packaging_class=descriptor.packaging_class,
+            temporary_dir=temporary_dir / "main",
+            python_root=configuration.python_root,
+        )
+        create_zip_archive(
+            stage_root=main_stage_root,
+            zip_path=build_dir / f"{archive_bases[0]}.zip",
+            archive_base=archive_bases[0],
+        )
+        copy_directory_contents(main_stage_root, repo_root)
+        if runtime_packages and devel_packages:
+            devel_stage_root = stage_selected_archives(
+                archive_paths=[
+                    archives[package_name] for package_name in devel_packages
+                ],
+                configuration=configuration,
+                packaging_class=descriptor.packaging_class,
+                temporary_dir=temporary_dir / "devel",
                 python_root=configuration.python_root,
             )
-        else:
-            stage_osgeo4w_merge(install_root=install_root, stage_root=stage_root)
-        build_dir = repo_root / "build"
-        build_dir.mkdir(parents=True, exist_ok=True)
-        create_zip_archive(
-            stage_root=stage_root,
-            zip_path=build_dir / f"{archive_base}.zip",
-            archive_base=archive_base,
-        )
-        copy_directory_contents(stage_root, repo_root)
+            create_zip_archive(
+                stage_root=devel_stage_root,
+                zip_path=build_dir / f"{archive_bases[1]}.zip",
+                archive_base=archive_bases[1],
+            )
     write_version_file(
         repo_root=repo_root,
         version=version,
-        archive_base=archive_base,
+        archive_bases=archive_bases,
     )
     write_repository_metadata(
         repo_root=repo_root,
@@ -989,7 +1071,7 @@ def package_source_recipe(
         packet_name=descriptor.packet_name,
         packaging_class=descriptor.packaging_class,
         version=version,
-        archive_base=archive_base,
+        archive_bases=archive_bases,
     )
     return repo_root
 
@@ -1001,7 +1083,7 @@ def write_repository_metadata(
     packet_name: str,
     packaging_class: str,
     version: str,
-    archive_base: str,
+    archive_bases: Sequence[str],
 ) -> None:
     metadata_path = repo_root / "build" / "metadata.json"
     metadata = {
@@ -1011,7 +1093,8 @@ def write_repository_metadata(
         "packet_name": packet_name,
         "packaging_class": packaging_class,
         "version": version,
-        "archive_base": archive_base,
+        "archive_base": archive_bases[0],
+        "archive_bases": list(archive_bases),
     }
     metadata_path.write_text(
         json.dumps(metadata, indent=2, sort_keys=True),
@@ -1127,22 +1210,79 @@ def changed_packages_from_git_diff(
 def open_zip_reader(
     artifacts_root: str,
     repo_name: str,
+    archive_base: Optional[str] = None,
 ) -> Tuple[zipfile.ZipFile, io.BytesIO]:
+    _version_text, _release_date, archive_bases = read_artifact_version_entries(
+        artifacts_root=artifacts_root,
+        repo_name=repo_name,
+    )
+    selected_archive_base = archive_base or archive_bases[0]
     if re.match(r"^https?://", artifacts_root):
-        version_url = f"{artifacts_root.rstrip('/')}/{repo_name}/build/version.str"
-        with open_url(version_url) as response:
-            version_lines = response.read().decode("utf-8").splitlines()
-        archive_base = version_lines[2].strip()
         archive_url = (
-            f"{artifacts_root.rstrip('/')}/{repo_name}/build/{archive_base}.zip"
+            f"{artifacts_root.rstrip('/')}/{repo_name}/build/"
+            f"{selected_archive_base}.zip"
         )
         with open_url(archive_url) as response:
             payload = io.BytesIO(response.read())
         return zipfile.ZipFile(payload), payload
     repo_root = Path(artifacts_root) / repo_name
-    archive_base = locate_archive_base(repo_root)
-    archive_path = repo_root / "build" / f"{archive_base}.zip"
+    archive_path = repo_root / "build" / f"{selected_archive_base}.zip"
     return zipfile.ZipFile(archive_path), io.BytesIO()
+
+
+def read_artifact_version_entries(
+    artifacts_root: str,
+    repo_name: str,
+) -> Tuple[str, str, List[str]]:
+    if re.match(r"^https?://", artifacts_root):
+        version_url = f"{artifacts_root.rstrip('/')}/{repo_name}/build/version.str"
+        with open_url(version_url) as response:
+            lines = response.read().decode("utf-8").splitlines()
+    else:
+        repo_root = Path(artifacts_root) / repo_name
+        lines = (repo_root / "build" / "version.str").read_text(
+            encoding="utf-8"
+        ).splitlines()
+    if len(lines) < 3:
+        raise ValueError(f"Malformed version.str for {repo_name}")
+    archive_bases = [line.strip() for line in lines[2:] if line.strip()]
+    if not archive_bases:
+        raise ValueError(f"No archive bases declared for {repo_name}")
+    return lines[0].strip(), lines[1].strip(), archive_bases
+
+
+def can_hydrate_source_recipe(
+    recipe: SourceRecipe,
+    configuration: BridgeConfiguration,
+    artifacts_root: str,
+) -> Tuple[bool, str]:
+    descriptor = configuration.describe(recipe.name, recipe.package_names)
+    try:
+        version_text, _release_date, archive_bases = read_artifact_version_entries(
+            artifacts_root=artifacts_root,
+            repo_name=descriptor.repo_name,
+        )
+    except Exception as error:
+        return False, str(error)
+
+    if recipe.package_version and recipe.package_version not in {"pip", "tbd"}:
+        if version_text != recipe.package_version:
+            return (
+                False,
+                "repka version {} does not match recipe version {}".format(
+                    version_text,
+                    recipe.package_version,
+                ),
+            )
+
+    runtime_packages, devel_packages = split_devel_packages(recipe.package_names)
+    if runtime_packages and devel_packages:
+        if not any("-devel-" in archive_base for archive_base in archive_bases):
+            return False, "devel archive is missing"
+        if not any("-devel-" not in archive_base for archive_base in archive_bases):
+            return False, "runtime archive is missing"
+
+    return True, "repka artifacts are available"
 
 
 def hydrate_source_recipe(
@@ -1152,32 +1292,45 @@ def hydrate_source_recipe(
     install_root: Path,
 ) -> None:
     descriptor = configuration.describe(recipe.name, recipe.package_names)
-    zip_handle, _payload = open_zip_reader(artifacts_root, descriptor.repo_name)
-    with zip_handle:
-        names = [
-            name for name in zip_handle.namelist() if name and not name.endswith("/")
-        ]
-        top_level_prefix = ""
-        if names:
-            top_level_prefix = names[0].split("/", 1)[0]
-        for member_name in names:
-            relative_name = member_name
-            if top_level_prefix and member_name.startswith(f"{top_level_prefix}/"):
-                relative_name = member_name[len(top_level_prefix) + 1 :]
-            if not relative_name:
-                continue
-            target_path = map_hydrated_path(
-                packaging_class=descriptor.packaging_class,
-                configuration=configuration,
-                install_root=install_root,
-                relative_name=relative_name,
-            )
-            if target_path is None:
-                continue
-            target_path.parent.mkdir(parents=True, exist_ok=True)
-            with zip_handle.open(member_name) as source_handle:
-                with target_path.open("wb") as target_handle:
-                    shutil.copyfileobj(source_handle, target_handle)
+    _version_text, _release_date, archive_bases = read_artifact_version_entries(
+        artifacts_root=artifacts_root,
+        repo_name=descriptor.repo_name,
+    )
+    for archive_base in archive_bases:
+        zip_handle, _payload = open_zip_reader(
+            artifacts_root,
+            descriptor.repo_name,
+            archive_base=archive_base,
+        )
+        with zip_handle:
+            names = [
+                name
+                for name in zip_handle.namelist()
+                if name and not name.endswith("/")
+            ]
+            top_level_prefix = ""
+            if names:
+                top_level_prefix = names[0].split("/", 1)[0]
+            for member_name in names:
+                relative_name = member_name
+                if top_level_prefix and member_name.startswith(
+                    f"{top_level_prefix}/"
+                ):
+                    relative_name = member_name[len(top_level_prefix) + 1 :]
+                if not relative_name:
+                    continue
+                target_path = map_hydrated_path(
+                    packaging_class=descriptor.packaging_class,
+                    configuration=configuration,
+                    install_root=install_root,
+                    relative_name=relative_name,
+                )
+                if target_path is None:
+                    continue
+                target_path.parent.mkdir(parents=True, exist_ok=True)
+                with zip_handle.open(member_name) as source_handle:
+                    with target_path.open("wb") as target_handle:
+                        shutil.copyfileobj(source_handle, target_handle)
     write_hydration_markers(install_root=install_root, recipe=recipe)
 
 
@@ -1463,6 +1616,7 @@ def build_command(args: argparse.Namespace) -> int:
             target_names=build_targets,
             disabled=disabled,
         )
+        build_target_set = set(build_targets)
         osgeo4w_root = ensure_osgeo4w_root(root_dir)
         LOGGER.info(
             f"Hydrating {len(bootstrap_names)} dependency repositories into {osgeo4w_root}"
@@ -1471,12 +1625,32 @@ def build_command(args: argparse.Namespace) -> int:
             bootstrap_names,
             "hydrate",
         ):
-            hydrate_source_recipe(
-                recipe=workspace.recipes[source_name],
+            recipe = workspace.recipes[source_name]
+            can_hydrate, reason = can_hydrate_source_recipe(
+                recipe=recipe,
                 configuration=configuration,
                 artifacts_root=args.repka_root,
-                install_root=osgeo4w_root,
             )
+            if can_hydrate:
+                hydrate_source_recipe(
+                    recipe=recipe,
+                    configuration=configuration,
+                    artifacts_root=args.repka_root,
+                    install_root=osgeo4w_root,
+                )
+                continue
+            LOGGER.info(
+                f"Scheduling dependency source build for {source_name}: {reason}"
+            )
+            build_target_set.add(source_name)
+        build_targets = workspace.build_targets(
+            names=sorted(build_target_set),
+            include_reverse_dependencies=args.build_reverse_dependencies,
+            disabled=disabled,
+        )
+        LOGGER.info(
+            f"Expanded build plan contains {len(build_targets)} packages after repka check"
+        )
         environment["OSGEO4W_SKIP_UPDATE"] = "1"
         environment["OSGEO4W_SKIP_MASTER_REPO"] = "1"
     build_arguments = build_targets + [f"{name}-" for name in sorted(disabled)]

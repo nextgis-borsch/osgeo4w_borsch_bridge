@@ -45,8 +45,10 @@ The bridge repacks those outputs into a repka-compatible repository root:
 
 - one repository directory such as `lib_openjpeg/`
 - one `build/version.str`
-- one compiler-tagged ZIP archive such as
+- one runtime compiler-tagged ZIP archive such as
   `openjpeg-2.5.4-MSVC-19.38-64bit.zip`
+- when OSGeo4W emits a `-devel` package, one additional compiler-tagged ZIP
+  such as `openjpeg-devel-2.5.4-MSVC-19.38-64bit.zip`
 
 This is why the mapping file is mandatory: one NextGIS repository may be built
 from several OSGeo4W binary packages, and QtIFW components may consume only a
@@ -86,8 +88,9 @@ python3 scripts/nextgis.py qtifw \
   --output nextgis/qtifw
 ```
 
-Build selected packages, hydrate dependencies from repka, repack them for
-borsch/repka and generate QtIFW metadata in one run:
+Build selected packages, hydrate dependencies from repka when the exact recipe
+version is available, rebuild missing or outdated dependencies from source,
+repack them for borsch/repka and generate QtIFW metadata in one run:
 
 ```bash
 python3 scripts/nextgis.py build \
