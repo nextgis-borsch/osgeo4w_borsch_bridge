@@ -1064,6 +1064,31 @@ def find_release_archives(
     return archives
 
 
+def discover_available_release_sources(
+    workspace: WorkspaceModel,
+    release_root: Path,
+) -> List[str]:
+    if not release_root.exists():
+        return []
+    source_names: Set[str] = set()
+    for child_path in sorted(release_root.iterdir()):
+        if not child_path.is_dir():
+            continue
+        try:
+            source_name = workspace.resolve_source_name(child_path.name)
+        except KeyError:
+            continue
+        recipe = workspace.recipes.get(source_name)
+        if recipe is None:
+            continue
+        try:
+            find_release_archives(recipe, release_root)
+        except FileNotFoundError:
+            continue
+        source_names.add(source_name)
+    return sorted(source_names)
+
+
 def load_snapshot_from_tag(
     root_dir: Path,
     tag_name: str,
@@ -1953,15 +1978,21 @@ def package_selected_sources(
     compiler_tag: str,
 ) -> None:
     source_name_list = sorted(source_names)
+    if not source_name_list:
+        LOGGER.warning(f"No available release packages found under {release_root}")
+        return
     for source_name in iter_with_progress(source_name_list, "package"):
         recipe = workspace.recipes[source_name]
         LOGGER.info(f"Packaging source recipe {source_name}")
-        package_source_recipe(
+        repo_root = package_source_recipe(
             recipe=recipe,
             configuration=configuration,
             release_root=release_root,
             artifacts_root=artifacts_root,
             compiler_tag=compiler_tag,
+        )
+        LOGGER.info(
+            f"Packaged source recipe {source_name} into {repo_root}"
         )
 
 
@@ -2057,20 +2088,24 @@ def package_command(args: argparse.Namespace) -> int:
     root_dir = args.root.resolve()
     configuration = BridgeConfiguration.load(args.config.resolve())
     workspace = WorkspaceModel.discover(root_dir)
+    release_root = args.release_root.resolve()
     if args.packages:
         source_names = sorted(
             {workspace.resolve_source_name(name) for name in args.packages}
         )
     else:
-        source_names = workspace.source_names()
+        source_names = discover_available_release_sources(
+            workspace=workspace,
+            release_root=release_root,
+        )
     compiler_tag = args.compiler_tag or detect_compiler_tag_for_root(root_dir)
     LOGGER.info(
-        f"Packaging {len(source_names)} repositories from {args.release_root.resolve()}"
+        f"Packaging {len(source_names)} repositories from {release_root}"
     )
     package_selected_sources(
         workspace=workspace,
         configuration=configuration,
-        release_root=args.release_root.resolve(),
+        release_root=release_root,
         artifacts_root=args.artifacts_root.resolve(),
         source_names=source_names,
         compiler_tag=compiler_tag,

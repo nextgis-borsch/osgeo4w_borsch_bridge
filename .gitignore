@@ -223,11 +223,13 @@ __marimo__/
 
 # OSGEO4W
 cygwin/
-scripts/*.exe
-scripts/*.zip
+*.exe
+*.zip
+*.obj
 scripts/cmake
 tmp/
 *.tar.gz
+*.tar.bz2
 package.log.*
 scripts/vs2019
 scripts/vs2022
@@ -238,3 +240,4 @@ nextgis/qtifw/
 src/*/osgeo4w/osgeo4w/
 x86_64/
 md5sums
+src/boost/boost_1_*/
