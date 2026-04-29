@@ -292,6 +292,13 @@ vs2022env() {
 		install_path=$(cygpath -aw "$vcdir")
 
 		if ! [ -f "$vcdir/VC/Auxiliary/Build/vcvarsall.bat" ]; then
+			if [ "${OSGEO4W_BOOTSTRAP_VS2022:-0}" != "1" ]; then
+				log "Visual Studio 2022 C++ toolchain was not found"
+				log "Automatic Build Tools installation is disabled by default because Visual Studio Installer is machine-wide and may require administrator rights"
+				log "Install the required components into the existing Visual Studio instance or rerun with OSGEO4W_BOOTSTRAP_VS2022=1 to allow a local bootstrap attempt at $vcdir"
+				return 1
+			fi
+
 			[ -x $OSGEO4W_SCRIPTS/vs_BuildTools.exe ] || (
 				cd $OSGEO4W_SCRIPTS
 				curl -JLO https://download.visualstudio.microsoft.com/download/pr/63b5064f-af60-4cbe-96cd-a9dd9d41ee3d/92559de62c05423d5cafd06fd34c35e51199b1a90f34284abbe5b1d6fb75342d/vs_BuildTools.exe
@@ -320,7 +327,7 @@ vs2022env() {
 
 	if ! [ -f "$vcdir/VC/Auxiliary/Build/vcvarsall.bat" ]; then
 		log "Visual Studio 2022 toolchain is unavailable at $vcdir"
-		log "Install Desktop development with C++ or let local Build Tools installation complete"
+		log "Install Desktop development with C++ or rerun with OSGEO4W_BOOTSTRAP_VS2022=1 to allow a local Build Tools installation attempt"
 		return 1
 	fi
 
