@@ -283,7 +283,15 @@ def has_required_cygwin_packages(
                 f"got {installed_version}"
             )
             return False
-    return result.returncode == 0
+    if result.returncode != 0:
+        LOGGER.debug(
+            f"cygcheck returned non-zero status {result.returncode} for {cygwin_root}"
+        )
+        return False
+    LOGGER.debug(
+        f"All required Cygwin packages are present in {cygwin_root}"
+    )
+    return True
 
 
 def is_cygwin_root(path: Path) -> bool:

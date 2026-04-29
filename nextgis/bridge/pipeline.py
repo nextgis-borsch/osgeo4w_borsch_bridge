@@ -422,6 +422,15 @@ def stream_subprocess_output(
     output_queue: Queue[Tuple[str, Optional[str]]] = Queue()
     stdout_lines: List[str] = []
     stderr_lines: List[str] = []
+    stderr_buffer: List[str] = []
+
+    def flush_stderr_buffer() -> None:
+        if not stderr_buffer:
+            return
+        message = "".join(stderr_buffer).rstrip("\r\n")
+        stderr_buffer.clear()
+        if message:
+            PROCESS_LOGGER.error(message)
 
     def read_stream(stream_name: str, stream: Optional[IO[str]]) -> None:
         if stream is None:
@@ -451,6 +460,7 @@ def stream_subprocess_output(
             stream_name, line = output_queue.get(timeout=1.0)
         except Empty:
             if process.poll() is not None and output_queue.empty():
+                flush_stderr_buffer()
                 break
             if time.monotonic() >= heartbeat_deadline:
                 LOGGER.info(f"Still running: {description}")
@@ -460,6 +470,8 @@ def stream_subprocess_output(
             continue
 
         if line is None:
+            if stream_name == "stderr":
+                flush_stderr_buffer()
             completed_streams.add(stream_name)
             continue
 
@@ -468,18 +480,21 @@ def stream_subprocess_output(
         )
         shell_log_frame = parse_shell_log_frame(line)
         if shell_log_frame is not None:
+            flush_stderr_buffer()
             logger_name, level, message = shell_log_frame
             logging.getLogger(logger_name).log(level, message)
             continue
         if stream_name == "stdout":
+            flush_stderr_buffer()
             stdout_lines.append(line)
             sys.stdout.write(line)
             sys.stdout.flush()
             continue
 
         stderr_lines.append(line)
-        PROCESS_LOGGER.error(line.rstrip())
+        stderr_buffer.append(line)
 
+    flush_stderr_buffer()
     stdout_thread.join(timeout=0)
     stderr_thread.join(timeout=0)
 
