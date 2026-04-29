@@ -20,6 +20,17 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from .config import BridgeConfiguration, QtIfwComponent
+from .runtime import (
+    DEFAULT_CYGWIN_MIRROR,
+    BootstrapOptions,
+    bootstrap_cygwin,
+    default_cygwin_root,
+    get_active_runtime,
+    is_windows_host,
+    remap_command,
+    resolve_runtime,
+    set_active_runtime,
+)
 
 
 ASSIGNMENT_RE = re.compile(r"^export\s+(?P<name>[A-Z_]+)=(?P<value>.+)$")
@@ -245,8 +256,13 @@ def run_command(
     environment: Optional[Dict[str, str]] = None,
     capture_output: bool = False,
 ) -> subprocess.CompletedProcess[str]:
+    runtime = get_active_runtime()
     merged_environment = os.environ.copy()
-    if environment:
+    if runtime is not None:
+        runtime.ensure_safe_directory(cwd)
+        merged_environment = runtime.build_environment(environment)
+        args = remap_command(args, runtime)
+    elif environment:
         merged_environment.update(environment)
     return subprocess.run(
         list(args),
@@ -805,7 +821,56 @@ def ensure_osgeo4w_root(root_dir: Path) -> Path:
     return osgeo4w_root
 
 
+def build_bootstrap_options(args: argparse.Namespace) -> BootstrapOptions:
+    return BootstrapOptions(
+        mirror=args.cygwin_mirror,
+        package_cache=args.cygwin_cache.resolve()
+        if args.cygwin_cache is not None
+        else None,
+        setup_executable=args.cygwin_setup.resolve()
+        if args.cygwin_setup is not None
+        else None,
+        force=getattr(args, "force", False),
+    )
+
+
+def activate_runtime(
+    args: argparse.Namespace,
+    bootstrap_if_missing: bool,
+) -> None:
+    runtime = resolve_runtime(
+        root_dir=args.root.resolve(),
+        explicit_cygwin_root=args.cygwin_root.resolve()
+        if args.cygwin_root is not None
+        else None,
+        bootstrap_if_missing=bootstrap_if_missing,
+        bootstrap_options=build_bootstrap_options(args),
+    )
+    set_active_runtime(runtime)
+
+
+def bootstrap_command(args: argparse.Namespace) -> int:
+    root_dir = args.root.resolve()
+    if not is_windows_host():
+        print("Cygwin bootstrap is only required on Windows hosts.")
+        return 0
+    set_active_runtime(None)
+    target_root = (
+        args.cygwin_root.resolve()
+        if args.cygwin_root is not None
+        else default_cygwin_root(root_dir)
+    )
+    installed_root = bootstrap_cygwin(
+        root_dir=root_dir,
+        cygwin_root=target_root,
+        options=build_bootstrap_options(args),
+    )
+    print(installed_root)
+    return 0
+
+
 def build_command(args: argparse.Namespace) -> int:
+    activate_runtime(args, bootstrap_if_missing=True)
     root_dir = args.root.resolve()
     configuration = BridgeConfiguration.load(args.config.resolve())
     workspace = WorkspaceModel.discover(root_dir)
@@ -914,12 +979,10 @@ def package_msi(
     environment["PKGS"] = " ".join(sorted(msi_sources))
     if mirror:
         environment["mirror"] = mirror
-    subprocess.run(
+    run_command(
         ["bash", "scripts/msis.sh"],
-        cwd=str(root_dir),
-        env=environment,
-        text=True,
-        check=True,
+        cwd=root_dir,
+        environment=environment,
     )
 
 
@@ -957,6 +1020,7 @@ def snapshot_command(args: argparse.Namespace) -> int:
 
 
 def changes_command(args: argparse.Namespace) -> int:
+    activate_runtime(args, bootstrap_if_missing=True)
     root_dir = args.root.resolve()
     configuration = BridgeConfiguration.load(args.config.resolve())
     workspace = WorkspaceModel.discover(root_dir)
@@ -1039,7 +1103,38 @@ def build_parser() -> argparse.ArgumentParser:
         default=Path("nextgis/config/repositories.json"),
         help="Path to NextGIS bridge configuration.",
     )
+    parser.add_argument(
+        "--cygwin-root",
+        type=Path,
+        help="Explicit Cygwin root used for bash, git and related tools on Windows.",
+    )
+    parser.add_argument(
+        "--cygwin-mirror",
+        default=DEFAULT_CYGWIN_MIRROR,
+        help="Cygwin mirror used when bootstrap installs a local runtime.",
+    )
+    parser.add_argument(
+        "--cygwin-cache",
+        type=Path,
+        help="Directory used as the local Cygwin package cache.",
+    )
+    parser.add_argument(
+        "--cygwin-setup",
+        type=Path,
+        help="Path to a cached setup-x86_64.exe executable.",
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    bootstrap_parser = subparsers.add_parser(
+        "bootstrap",
+        help="Install a local Cygwin runtime for NextGIS bridge commands.",
+    )
+    bootstrap_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Redownload setup-x86_64.exe before running the installer.",
+    )
+    bootstrap_parser.set_defaults(handler=bootstrap_command)
 
     snapshot_parser = subparsers.add_parser("snapshot", help="Write build snapshot.")
     snapshot_parser.add_argument(
