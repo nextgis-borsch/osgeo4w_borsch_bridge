@@ -20,7 +20,7 @@ but adds a NextGIS-specific orchestration layer that can:
 
 - `scripts/build.sh`, `scripts/build-inorder.pl`, `scripts/msis.sh`
   preserve the upstream OSGeo4W build flow.
-- `scripts/nextgis.py` is the new entry point for NextGIS workflows.
+- `scripts/borsch.py` is the entry point for bridge workflows.
 - `nextgis/bridge/` contains the Python orchestration code.
 - `nextgis/config/repositories.json` is the source-of-truth mapping for:
   - bridge source package name;
@@ -61,20 +61,20 @@ Run all commands from the repository root.
 Create a build snapshot:
 
 ```bash
-python3 scripts/nextgis.py snapshot \
+python3 scripts/borsch.py snapshot \
   --output nextgis/state/build-manifest.json
 ```
 
 List packages changed since a tag:
 
 ```bash
-python3 scripts/nextgis.py changes --tag v1.0.0
+python3 scripts/borsch.py changes --tag v1.0.0
 ```
 
 Convert finished OSGeo4W release tarballs into repka-compatible repositories:
 
 ```bash
-python3 scripts/nextgis.py package \
+python3 scripts/borsch.py package \
   gdal openjpeg nextgisqgis ngstd sentrynative \
   --release-root x86_64/release \
   --artifacts-root nextgis/artifacts
@@ -83,7 +83,7 @@ python3 scripts/nextgis.py package \
 Generate QtIFW overlay metadata from the repacked repositories:
 
 ```bash
-python3 scripts/nextgis.py qtifw \
+python3 scripts/borsch.py qtifw \
   --artifacts-root nextgis/artifacts \
   --output nextgis/qtifw
 ```
@@ -93,7 +93,7 @@ version is available, rebuild missing or outdated dependencies from source,
 repack them for borsch/repka and generate QtIFW metadata in one run:
 
 ```bash
-python3 scripts/nextgis.py build \
+python3 scripts/borsch.py build \
   nextgisqgis ngstd sentrynative \
   --repka-root https://rm.nextgis.com/repository/windows \
   --release-root x86_64/release \
@@ -105,7 +105,7 @@ python3 scripts/nextgis.py build \
 Build only packages changed since a tag and also build reverse dependencies:
 
 ```bash
-python3 scripts/nextgis.py build \
+python3 scripts/borsch.py build \
   --changed-since-tag v1.0.0 \
   --build-reverse-dependencies
 ```
@@ -113,14 +113,14 @@ python3 scripts/nextgis.py build \
 Build everything from source and ignore repka hydration completely:
 
 ```bash
-python3 scripts/nextgis.py build --ignore-repka
+python3 scripts/borsch.py build --ignore-repka
 ```
 
 Allow explicit fallback to OSGeo4W for dependencies that are neither available
 locally nor via repka:
 
 ```bash
-python3 scripts/nextgis.py build \
+python3 scripts/borsch.py build \
   curl \
   --allow-osgeo4w-deps
 ```
@@ -128,7 +128,7 @@ python3 scripts/nextgis.py build \
 Request MSI output through the legacy MSI pipeline:
 
 ```bash
-python3 scripts/nextgis.py build \
+python3 scripts/borsch.py build \
   nextgisqgis \
   --packaging-backend both \
   --msi-mirror https://download.osgeo.org/osgeo4w/v2
@@ -181,7 +181,7 @@ packages:
 ## Environment Notes
 
 - The build recipes still assume the existing OSGeo4W and MSVC environment.
-- `scripts/nextgis.py` is orchestration only. It does not replace
+- `scripts/borsch.py` is orchestration only. It does not replace
   `scripts/build.sh`; it drives it.
 - Build dependency fallback to the public OSGeo4W repository is disabled by
   default. Use `--allow-osgeo4w-deps` when that behavior is required

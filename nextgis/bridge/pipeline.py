@@ -26,8 +26,14 @@ from queue import Empty, Queue
 from typing import Dict, IO, Iterable, List, Optional, Sequence, Set, Tuple
 
 from .config import BridgeConfiguration, QtIfwComponent
+from .logging_support import (
+    LOGGER,
+    LOGGING_SETTINGS,
+    PROCESS_LOGGER,
+    iter_with_progress,
+    parse_shell_log_frame,
+)
 from .runtime import (
-    DEFAULT_CYGWIN_MIRROR,
     BootstrapOptions,
     bootstrap_cygwin,
     default_cygwin_root,
@@ -37,14 +43,7 @@ from .runtime import (
     remap_command,
     resolve_runtime,
     set_active_runtime,
-    set_active_proxy,
-    set_runtime_progress_enabled,
 )
-
-try:
-    from tqdm import tqdm as tqdm_module  # type: ignore[import-not-found]
-except ImportError:
-    tqdm_module = None
 
 
 ASSIGNMENT_RE = re.compile(r"^export\s+(?P<name>[A-Z_]+)=(?P<value>.+)$")
@@ -56,35 +55,6 @@ PACKAGE_VERSION_RE = re.compile(
     r"^(?P<version>.+)-(?P<binary>\d+|next|tbd)$"
 )
 COMPILER_BANNER_RE = re.compile(r"Compiler banner:\s*(?P<banner>.+)")
-
-
-@dataclass
-class LoggingSettings:
-    quiet: bool = False
-    progress_enabled: bool = False
-    heartbeat_seconds: int = 60
-
-
-LOGGING_SETTINGS = LoggingSettings()
-LOGGER_NAMESPACE = "osgeo4w_borsch_bridge"
-LOGGER = logging.getLogger(f"{LOGGER_NAMESPACE}.pipeline")
-PROCESS_LOGGER = logging.getLogger(f"{LOGGER_NAMESPACE}.process")
-SHELL_LOG_PREFIX = "\x1eOSGEO4W_BRIDGE_LOG\x1f"
-
-
-class TqdmLoggingHandler(logging.StreamHandler):
-    def emit(self, record: logging.LogRecord) -> None:
-        try:
-            message = self.format(record)
-            output_stream = sys.stderr if record.levelno >= logging.ERROR else sys.stdout
-            if LOGGING_SETTINGS.progress_enabled and tqdm_module is not None:
-                tqdm_module.write(message, file=output_stream)
-            else:
-                stream = output_stream
-                stream.write(message + self.terminator)
-                self.flush()
-        except Exception:
-            self.handleError(record)
 
 
 @dataclass
@@ -296,57 +266,6 @@ def sha256_chain(first_value: str, second_value: str) -> str:
     return sha256_text(f"{first_value}:{second_value}")
 
 
-def configure_logging(args: argparse.Namespace) -> None:
-    log_level = getattr(logging, str(args.log_level).upper())
-    LOGGING_SETTINGS.quiet = bool(args.quiet)
-    LOGGING_SETTINGS.progress_enabled = bool(
-        not args.quiet
-        and not args.no_progress
-        and tqdm_module is not None
-        and sys.stdout.isatty()
-    )
-    LOGGING_SETTINGS.heartbeat_seconds = int(args.heartbeat_seconds)
-    set_runtime_progress_enabled(not args.quiet and not args.no_progress)
-
-    root_logger = logging.getLogger(LOGGER_NAMESPACE)
-    root_logger.handlers.clear()
-    root_logger.propagate = False
-    root_logger.setLevel(log_level)
-
-    handler = TqdmLoggingHandler(stream=sys.stdout)
-    handler.setFormatter(
-        logging.Formatter("%(asctime)s: [%(name)s] %(levelname)s %(message)s")
-    )
-    root_logger.addHandler(handler)
-
-    for logger_name in (
-        LOGGER_NAMESPACE,
-        f"{LOGGER_NAMESPACE}.pipeline",
-        f"{LOGGER_NAMESPACE}.runtime",
-        f"{LOGGER_NAMESPACE}.process",
-    ):
-        current_logger = logging.getLogger(logger_name)
-        current_logger.setLevel(log_level)
-        current_logger.propagate = logger_name != LOGGER_NAMESPACE
-
-    if LOGGING_SETTINGS.quiet:
-        for logger_name in (
-            LOGGER_NAMESPACE,
-            f"{LOGGER_NAMESPACE}.pipeline",
-            f"{LOGGER_NAMESPACE}.runtime",
-            f"{LOGGER_NAMESPACE}.process",
-        ):
-            logging.getLogger(logger_name).disabled = True
-    else:
-        for logger_name in (
-            LOGGER_NAMESPACE,
-            f"{LOGGER_NAMESPACE}.pipeline",
-            f"{LOGGER_NAMESPACE}.runtime",
-            f"{LOGGER_NAMESPACE}.process",
-        ):
-            logging.getLogger(logger_name).disabled = False
-
-
 def format_command(args: Sequence[str]) -> str:
     return " ".join(str(argument) for argument in args)
 
@@ -364,38 +283,6 @@ def first_output_line(output_text: str) -> str:
         if stripped_line:
             return stripped_line
     return "unknown"
-
-
-def iter_with_progress(
-    items: Sequence[str],
-    description: str,
-) -> Iterable[str]:
-    if not LOGGING_SETTINGS.progress_enabled:
-        return items
-    if tqdm_module is None:
-        return items
-    return tqdm_module(
-        items,
-        desc=description,
-        unit="pkg",
-        dynamic_ncols=True,
-    )
-
-
-def parse_shell_log_frame(
-    line: str,
-) -> Optional[Tuple[str, int, str]]:
-    if not line.startswith(SHELL_LOG_PREFIX):
-        return None
-    payload = line[len(SHELL_LOG_PREFIX):].rstrip("\r\n")
-    parts = payload.split("\x1f", 2)
-    if len(parts) != 3:
-        return None
-    logger_name, level_name, message = parts
-    if not logger_name:
-        return None
-    level = getattr(logging, level_name.upper(), logging.INFO)
-    return logger_name, int(level), message
 
 
 def stream_subprocess_output(
@@ -2055,34 +1942,50 @@ def qtifw_command(args: argparse.Namespace) -> int:
 def clean_command(args: argparse.Namespace) -> int:
     root_dir = args.root.resolve()
     clean_paths: List[Path] = []
-    scope_label = "full"
-    if args.src:
-        scope_label = "src"
-        clean_paths = [root_dir / "src"]
-    elif args.artifacts:
-        scope_label = "artifacts"
-        clean_paths = [
-            root_dir / "tmp",
-            root_dir / "x86_64",
-            root_dir / "nextgis" / "artifacts",
-        ]
+    selected_scopes: List[str] = []
+    if args.full:
+        selected_scopes.append("full")
+    else:
+        if args.src:
+            selected_scopes.append("src")
+            clean_paths.append(root_dir / "src")
+        if args.artifacts:
+            selected_scopes.append("artifacts")
+            clean_paths.extend(
+                [
+                    root_dir / "tmp",
+                    root_dir / "x86_64",
+                    root_dir / "nextgis" / "artifacts",
+                ]
+            )
 
-    existing_paths = [path for path in clean_paths if path.exists()]
-    if scope_label != "full" and not existing_paths:
-        LOGGER.info(f"Nothing to clean for scope {scope_label}")
+    existing_paths: List[Path] = []
+    seen_paths: Set[Path] = set()
+    for path in clean_paths:
+        if not path.exists() or path in seen_paths:
+            continue
+        seen_paths.add(path)
+        existing_paths.append(path)
+
+    if not args.full and not existing_paths:
+        LOGGER.info(
+            "Nothing to clean for scopes: "
+            f"{', '.join(selected_scopes)}"
+        )
         return 0
 
     command = ["git", "clean", "-fdx"]
     if args.dry_run:
         command.append("-n")
-    if scope_label != "full":
+    if not args.full:
         command.append("--")
         command.extend(
             path.relative_to(root_dir).as_posix() for path in existing_paths
         )
 
     LOGGER.info(
-        f"Cleaning scope {scope_label}"
+        "Cleaning scopes "
+        f"{', '.join(selected_scopes)}"
         + (" in dry-run mode" if args.dry_run else "")
     )
     run_command(
@@ -2091,286 +1994,3 @@ def clean_command(args: argparse.Namespace) -> int:
         description="Cleaning untracked repository files",
     )
     return 0
-
-
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="NextGIS bridge orchestration for OSGeo4W, repka and QtIFW."
-    )
-    parser.add_argument(
-        "--root",
-        type=Path,
-        default=Path.cwd(),
-        help="Repository root.",
-    )
-    parser.add_argument(
-        "--config",
-        type=Path,
-        default=Path("nextgis/config/repositories.json"),
-        help="Path to NextGIS bridge configuration.",
-    )
-    parser.add_argument(
-        "--cygwin-root",
-        type=Path,
-        help="Explicit Cygwin root used for bash, git and related tools on Windows.",
-    )
-    parser.add_argument(
-        "--cygwin-mirror",
-        default=DEFAULT_CYGWIN_MIRROR,
-        help="Cygwin mirror used when bootstrap installs a local runtime.",
-    )
-    parser.add_argument(
-        "--proxy",
-        default="",
-        help="Proxy URL used for network requests and Cygwin bootstrap.",
-    )
-    parser.add_argument(
-        "--cygwin-cache",
-        type=Path,
-        help="Directory used as the local Cygwin package cache.",
-    )
-    parser.add_argument(
-        "--cygwin-setup",
-        type=Path,
-        help="Path to a cached setup-x86_64.exe executable.",
-    )
-    parser.add_argument(
-        "--quiet",
-        action="store_true",
-        help="Suppress wrapper logs and child process output.",
-    )
-    parser.add_argument(
-        "--log-level",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
-        default="INFO",
-        help="Logging level for wrapper diagnostics.",
-    )
-    parser.add_argument(
-        "--no-progress",
-        action="store_true",
-        help="Disable tqdm progress bars even when tqdm is available.",
-    )
-    parser.add_argument(
-        "--heartbeat-seconds",
-        type=int,
-        default=60,
-        help="Emit a heartbeat message if a child process stays silent for N seconds.",
-    )
-    subparsers = parser.add_subparsers(dest="command", required=True)
-
-    bootstrap_parser = subparsers.add_parser(
-        "bootstrap",
-        help="Install a local Cygwin runtime for NextGIS bridge commands.",
-    )
-    bootstrap_parser.add_argument(
-        "--force",
-        action="store_true",
-        help="Redownload setup-x86_64.exe before running the installer.",
-    )
-    bootstrap_parser.set_defaults(handler=bootstrap_command)
-
-    snapshot_parser = subparsers.add_parser("snapshot", help="Write build snapshot.")
-    snapshot_parser.add_argument(
-        "--output",
-        type=Path,
-        required=True,
-        help="Snapshot file path.",
-    )
-    snapshot_parser.set_defaults(handler=snapshot_command)
-
-    changes_parser = subparsers.add_parser(
-        "changes",
-        help="List changed packages since a git tag.",
-    )
-    changes_parser.add_argument("--tag", required=True, help="Git tag name.")
-    changes_parser.add_argument(
-        "--output-format",
-        choices=["text", "json"],
-        default="text",
-        help="Output format.",
-    )
-    changes_parser.set_defaults(handler=changes_command)
-
-    clean_parser = subparsers.add_parser(
-        "clean",
-        help="Remove untracked build outputs from the repository.",
-    )
-    clean_scope = clean_parser.add_mutually_exclusive_group(required=True)
-    clean_scope.add_argument(
-        "--src",
-        action="store_true",
-        help="Clean untracked files under src/.",
-    )
-    clean_scope.add_argument(
-        "--artifacts",
-        action="store_true",
-        help="Clean tmp/, x86_64/ and nextgis/artifacts/.",
-    )
-    clean_scope.add_argument(
-        "--full",
-        action="store_true",
-        help="Clean untracked files across the entire repository.",
-    )
-    clean_parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Show what would be removed without deleting it.",
-    )
-    clean_parser.set_defaults(handler=clean_command)
-
-    package_parser = subparsers.add_parser(
-        "package",
-        help="Convert OSGeo4W artifacts into repka-compatible packages.",
-    )
-    package_parser.add_argument(
-        "packages",
-        nargs="*",
-        help="Source package names or binary package names.",
-    )
-    package_parser.add_argument(
-        "--release-root",
-        type=Path,
-        default=Path("x86_64/release"),
-        help="OSGeo4W release root.",
-    )
-    package_parser.add_argument(
-        "--artifacts-root",
-        type=Path,
-        required=True,
-        help="Output root for repka-compatible repositories.",
-    )
-    package_parser.add_argument(
-        "--compiler-tag",
-        default="",
-        help="Explicit compiler tag used in archive names.",
-    )
-    package_parser.set_defaults(handler=package_command)
-
-    qtifw_parser = subparsers.add_parser(
-        "qtifw",
-        help="Generate QtIFW package metadata overlay.",
-    )
-    qtifw_parser.add_argument(
-        "packages",
-        nargs="*",
-        help="Source package names or binary package names.",
-    )
-    qtifw_parser.add_argument(
-        "--artifacts-root",
-        type=Path,
-        required=True,
-        help="Repka-compatible artifacts root.",
-    )
-    qtifw_parser.add_argument(
-        "--output",
-        type=Path,
-        required=True,
-        help="Output directory for generated QtIFW overlay.",
-    )
-    qtifw_parser.set_defaults(handler=qtifw_command)
-
-    build_parser_obj = subparsers.add_parser(
-        "build",
-        help="Build packages and optionally package them for repka or MSI.",
-    )
-    build_parser_obj.add_argument(
-        "packages",
-        nargs="*",
-        help="Source package names or binary package names.",
-    )
-    build_parser_obj.add_argument(
-        "--disable",
-        action="append",
-        default=[],
-        help="Disable a source recipe or binary package from the build graph.",
-    )
-    build_parser_obj.add_argument(
-        "--changed-since-tag",
-        default="",
-        help="Build only packages changed since the provided tag.",
-    )
-    build_parser_obj.add_argument(
-        "--build-reverse-dependencies",
-        action="store_true",
-        help="Build reverse dependencies of selected packages.",
-    )
-    build_parser_obj.add_argument(
-        "--continue-on-error",
-        action="store_true",
-        help="Continue the build if a package fails.",
-    )
-    build_parser_obj.add_argument(
-        "--release-root",
-        type=Path,
-        default=Path("x86_64/release"),
-        help="OSGeo4W release root.",
-    )
-    build_parser_obj.add_argument(
-        "--artifacts-root",
-        type=Path,
-        default=Path("nextgis/artifacts"),
-        help="Output root for repka-compatible repositories.",
-    )
-    build_parser_obj.add_argument(
-        "--qtifw-output",
-        type=Path,
-        help="Output directory for generated QtIFW overlay.",
-    )
-    build_parser_obj.add_argument(
-        "--snapshot-output",
-        type=Path,
-        help="Write a build snapshot after the build.",
-    )
-    build_parser_obj.add_argument(
-        "--packaging-backend",
-        choices=["none", "borsch", "msi", "both"],
-        default="borsch",
-        help="Packaging backend selection.",
-    )
-    build_parser_obj.add_argument(
-        "--repka-root",
-        default="",
-        help="Local path or HTTP root with repka-compatible artifacts.",
-    )
-    build_parser_obj.add_argument(
-        "--ignore-repka",
-        action="store_true",
-        help="Ignore repka artifacts even if repka root is provided.",
-    )
-    build_parser_obj.add_argument(
-        "--allow-osgeo4w-deps",
-        action="store_true",
-        help=(
-            "Allow unresolved external dependencies to be fetched from "
-            "OSGeo4W via osgeo4w-setup.exe."
-        ),
-    )
-    build_parser_obj.add_argument(
-        "--compiler-tag",
-        default="",
-        help="Explicit compiler tag used in archive names.",
-    )
-    build_parser_obj.add_argument(
-        "--osgeo4w-repo",
-        type=Path,
-        help="Explicit local OSGeo4W repository path.",
-    )
-    build_parser_obj.add_argument(
-        "--msi-mirror",
-        default="",
-        help="Mirror path or URL passed to scripts/msis.sh.",
-    )
-    build_parser_obj.set_defaults(handler=build_command)
-    return parser
-
-
-def main(argv: Optional[Sequence[str]] = None) -> int:
-    parser = build_parser()
-    args = parser.parse_args(argv)
-    set_active_proxy(args.proxy)
-    configure_logging(args)
-    return int(args.handler(args))
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
