@@ -6,17 +6,22 @@ import hashlib
 import io
 import json
 import os
+import platform
 import re
 import shutil
 import subprocess
+import sys
 import tarfile
 import tempfile
+import threading
+import time
 import urllib.request
 import zipfile
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from queue import Empty, Queue
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from .config import BridgeConfiguration, QtIfwComponent
@@ -32,6 +37,11 @@ from .runtime import (
     set_active_runtime,
 )
 
+try:
+    from tqdm import tqdm as tqdm_module  # type: ignore[import-not-found]
+except ImportError:
+    tqdm_module = None
+
 
 ASSIGNMENT_RE = re.compile(r"^export\s+(?P<name>[A-Z_]+)=(?P<value>.+)$")
 DEFAULT_ASSIGNMENT_RE = re.compile(
@@ -41,6 +51,16 @@ CL_VERSION_RE = re.compile(r"Version\s+(?P<major>\d+)\.(?P<minor>\d+)")
 PACKAGE_VERSION_RE = re.compile(
     r"^(?P<version>.+)-(?P<binary>\d+|next|tbd)$"
 )
+
+
+@dataclass
+class LoggingSettings:
+    quiet: bool = False
+    progress_enabled: bool = False
+    heartbeat_seconds: int = 60
+
+
+LOGGING_SETTINGS = LoggingSettings()
 
 
 @dataclass
@@ -250,11 +270,149 @@ def sha256_chain(first_value: str, second_value: str) -> str:
     return sha256_text(f"{first_value}:{second_value}")
 
 
+def configure_logging(args: argparse.Namespace) -> None:
+    LOGGING_SETTINGS.quiet = bool(args.quiet)
+    LOGGING_SETTINGS.progress_enabled = bool(
+        not args.quiet
+        and not args.no_progress
+        and tqdm_module is not None
+        and sys.stdout.isatty()
+    )
+    LOGGING_SETTINGS.heartbeat_seconds = int(args.heartbeat_seconds)
+
+
+def emit_log_line(message: str) -> None:
+    if LOGGING_SETTINGS.progress_enabled and tqdm_module is not None:
+        tqdm_module.write(message)
+        return
+    print(message, flush=True)
+
+
+def log_message(message: str) -> None:
+    if LOGGING_SETTINGS.quiet:
+        return
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    emit_log_line(f"{timestamp}: [nextgis] {message}")
+
+
+def format_command(args: Sequence[str]) -> str:
+    return " ".join(str(argument) for argument in args)
+
+
+def first_output_line(output_text: str) -> str:
+    for line in output_text.splitlines():
+        stripped_line = line.strip()
+        if stripped_line:
+            return stripped_line
+    return "unknown"
+
+
+def iter_with_progress(
+    items: Sequence[str],
+    description: str,
+) -> Iterable[str]:
+    if not LOGGING_SETTINGS.progress_enabled:
+        return items
+    if tqdm_module is None:
+        return items
+    return tqdm_module(
+        items,
+        desc=description,
+        unit="pkg",
+        dynamic_ncols=True,
+    )
+
+
+def stream_subprocess_output(
+    args: Sequence[str],
+    cwd: Path,
+    merged_environment: Dict[str, str],
+    description: str,
+) -> subprocess.CompletedProcess[str]:
+    if LOGGING_SETTINGS.quiet:
+        completed_process = subprocess.run(
+            list(args),
+            cwd=str(cwd),
+            env=merged_environment,
+            text=True,
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return subprocess.CompletedProcess(
+            completed_process.args,
+            completed_process.returncode,
+            stdout="",
+            stderr="",
+        )
+
+    process = subprocess.Popen(
+        list(args),
+        cwd=str(cwd),
+        env=merged_environment,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        bufsize=1,
+    )
+    output_queue: Queue[Optional[str]] = Queue()
+    output_lines: List[str] = []
+
+    def read_output() -> None:
+        assert process.stdout is not None
+        for line in process.stdout:
+            output_queue.put(line)
+        output_queue.put(None)
+
+    reader_thread = threading.Thread(target=read_output, daemon=True)
+    reader_thread.start()
+    heartbeat_deadline = time.monotonic() + LOGGING_SETTINGS.heartbeat_seconds
+
+    while True:
+        try:
+            line = output_queue.get(timeout=1.0)
+        except Empty:
+            if process.poll() is not None and output_queue.empty():
+                break
+            if time.monotonic() >= heartbeat_deadline:
+                log_message(f"Still running: {description}")
+                heartbeat_deadline = (
+                    time.monotonic() + LOGGING_SETTINGS.heartbeat_seconds
+                )
+            continue
+
+        if line is None:
+            break
+
+        output_lines.append(line)
+        heartbeat_deadline = (
+            time.monotonic() + LOGGING_SETTINGS.heartbeat_seconds
+        )
+        sys.stdout.write(line)
+        sys.stdout.flush()
+
+    return_code = process.wait()
+    stdout_text = "".join(output_lines)
+    if return_code != 0:
+        raise subprocess.CalledProcessError(
+            return_code,
+            list(args),
+            output=stdout_text,
+        )
+    return subprocess.CompletedProcess(
+        list(args),
+        return_code,
+        stdout=stdout_text,
+        stderr="",
+    )
+
+
 def run_command(
     args: Sequence[str],
     cwd: Path,
     environment: Optional[Dict[str, str]] = None,
     capture_output: bool = False,
+    description: str = "",
 ) -> subprocess.CompletedProcess[str]:
     runtime = get_active_runtime()
     merged_environment = os.environ.copy()
@@ -264,14 +422,109 @@ def run_command(
         args = remap_command(args, runtime)
     elif environment:
         merged_environment.update(environment)
-    return subprocess.run(
+
+    command_text = format_command(args)
+    if description:
+        log_message(f"{description}: {command_text}")
+    elif not capture_output:
+        log_message(f"Running command: {command_text}")
+
+    if capture_output:
+        return subprocess.run(
+            list(args),
+            cwd=str(cwd),
+            env=merged_environment,
+            text=True,
+            check=True,
+            capture_output=True,
+        )
+
+    return stream_subprocess_output(
         list(args),
-        cwd=str(cwd),
-        env=merged_environment,
-        text=True,
-        check=True,
-        capture_output=capture_output,
+        cwd=cwd,
+        merged_environment=merged_environment,
+        description=description or command_text,
     )
+
+
+def capture_optional_command(
+    args: Sequence[str],
+    cwd: Path,
+    environment: Optional[Dict[str, str]] = None,
+) -> str:
+    runtime = get_active_runtime()
+    merged_environment = os.environ.copy()
+    command_args = list(args)
+    if runtime is not None:
+        merged_environment = runtime.build_environment(environment)
+        command_args = list(remap_command(command_args, runtime))
+    elif environment:
+        merged_environment.update(environment)
+
+    try:
+        completed_process = subprocess.run(
+            command_args,
+            cwd=str(cwd),
+            env=merged_environment,
+            text=True,
+            check=False,
+            capture_output=True,
+        )
+    except FileNotFoundError:
+        return "not found"
+
+    output_text = "\n".join(
+        part for part in [completed_process.stdout, completed_process.stderr] if part
+    )
+    return first_output_line(output_text) if output_text else "unknown"
+
+
+def log_build_environment_summary(
+    root_dir: Path,
+    args: argparse.Namespace,
+) -> None:
+    runtime = get_active_runtime()
+    runtime_name = "native"
+    runtime_root = "PATH"
+    if runtime is not None and runtime.uses_cygwin and runtime.cygwin_root is not None:
+        runtime_name = "cygwin"
+        runtime_root = str(runtime.cygwin_root)
+
+    log_message(f"Host OS: {platform.platform()}")
+    log_message(f"Host Python: {platform.python_version()}")
+    log_message(f"Execution runtime: {runtime_name} ({runtime_root})")
+    log_message(f"Progress bars: {'enabled' if LOGGING_SETTINGS.progress_enabled else 'disabled'}")
+    log_message(
+        "Paths: "
+        f"release={args.release_root.resolve()}, "
+        f"artifacts={args.artifacts_root.resolve()}"
+    )
+
+    bash_version = capture_optional_command(["bash", "--version"], root_dir)
+    git_version = capture_optional_command(["git", "--version"], root_dir)
+    log_message(f"Bash: {bash_version}")
+    log_message(f"Git: {git_version}")
+
+    if runtime is not None and runtime.uses_cygwin:
+        cygwin_os = capture_optional_command(
+            ["bash", "-lc", "uname -srvmo"],
+            root_dir,
+        )
+        cygpath_version = capture_optional_command(
+            ["cygpath", "--version"],
+            root_dir,
+        )
+        log_message(f"Cygwin OS: {cygwin_os}")
+        log_message(f"Cygwin tools: {cygpath_version}")
+
+    compiler_banner = capture_optional_command(["cl"], root_dir)
+    if compiler_banner in {"unknown", "not found"}:
+        log_message(
+            "Compiler: not yet available in the wrapper environment; "
+            "recipe-level compiler details will be logged after vsenv()."
+        )
+    else:
+        log_message(f"Compiler: {compiler_banner}")
 
 
 def detect_compiler_tag() -> str:
@@ -696,7 +949,8 @@ def generate_qtifw_overlay(
         shutil.rmtree(output_root)
     packages_root = output_root / "packages"
     packages_root.mkdir(parents=True, exist_ok=True)
-    for source_name in sorted(selected_names):
+    selected_name_list = sorted(selected_names)
+    for source_name in iter_with_progress(selected_name_list, "qtifw"):
         recipe = workspace.recipes[source_name]
         descriptor = configuration.describe(source_name, recipe.package_names)
         repo_root = artifacts_root / descriptor.repo_name
@@ -812,6 +1066,8 @@ def build_environment(args: argparse.Namespace) -> Dict[str, str]:
         environment["OSGEO4W_CONTINUE_BUILD"] = "1"
     if args.osgeo4w_repo:
         environment["OSGEO4W_REP"] = str(args.osgeo4w_repo)
+    if args.quiet:
+        environment["OSGEO4W_QUIET"] = "1"
     return environment
 
 
@@ -847,6 +1103,14 @@ def activate_runtime(
         bootstrap_options=build_bootstrap_options(args),
     )
     set_active_runtime(runtime)
+    runtime_name = "native"
+    runtime_root = "PATH"
+    if runtime.uses_cygwin and runtime.cygwin_root is not None:
+        runtime_name = "cygwin"
+        runtime_root = str(runtime.cygwin_root)
+    log_message(
+        f"Runtime={runtime_name}, root={runtime_root}, workspace={args.root.resolve()}"
+    )
 
 
 def bootstrap_command(args: argparse.Namespace) -> int:
@@ -860,11 +1124,13 @@ def bootstrap_command(args: argparse.Namespace) -> int:
         if args.cygwin_root is not None
         else default_cygwin_root(root_dir)
     )
+    log_message(f"Bootstrapping Cygwin into {target_root}")
     installed_root = bootstrap_cygwin(
         root_dir=root_dir,
         cygwin_root=target_root,
         options=build_bootstrap_options(args),
     )
+    log_message(f"Cygwin runtime is ready at {installed_root}")
     print(installed_root)
     return 0
 
@@ -872,6 +1138,7 @@ def bootstrap_command(args: argparse.Namespace) -> int:
 def build_command(args: argparse.Namespace) -> int:
     activate_runtime(args, bootstrap_if_missing=True)
     root_dir = args.root.resolve()
+    log_build_environment_summary(root_dir, args)
     configuration = BridgeConfiguration.load(args.config.resolve())
     workspace = WorkspaceModel.discover(root_dir)
     disabled = {workspace.resolve_source_name(name) for name in args.disable}
@@ -886,6 +1153,11 @@ def build_command(args: argparse.Namespace) -> int:
         include_reverse_dependencies=args.build_reverse_dependencies,
         disabled=disabled,
     )
+    log_message(
+        f"Build plan contains {len(build_targets)} packages; backend={args.packaging_backend}"
+    )
+    if build_targets:
+        log_message(f"Build targets: {' '.join(build_targets)}")
     environment = build_environment(args)
     if args.repka_root and not args.ignore_repka:
         bootstrap_names = workspace.bootstrap_sources(
@@ -893,7 +1165,13 @@ def build_command(args: argparse.Namespace) -> int:
             disabled=disabled,
         )
         osgeo4w_root = ensure_osgeo4w_root(root_dir)
-        for source_name in bootstrap_names:
+        log_message(
+            f"Hydrating {len(bootstrap_names)} dependency repositories into {osgeo4w_root}"
+        )
+        for source_name in iter_with_progress(
+            bootstrap_names,
+            "hydrate",
+        ):
             hydrate_source_recipe(
                 recipe=workspace.recipes[source_name],
                 configuration=configuration,
@@ -908,12 +1186,15 @@ def build_command(args: argparse.Namespace) -> int:
             ["bash", "scripts/build.sh", *build_arguments],
             cwd=root_dir,
             environment=environment,
+            description="Executing OSGeo4W build pipeline",
         )
     if args.snapshot_output:
+        log_message(f"Writing snapshot to {args.snapshot_output.resolve()}")
         snapshot = workspace.snapshot(configuration)
         write_snapshot_file(snapshot, args.snapshot_output.resolve())
     if args.packaging_backend in {"borsch", "both"}:
         compiler_tag = args.compiler_tag or detect_compiler_tag()
+        log_message(f"Packaging repka artifacts with compiler tag {compiler_tag}")
         package_selected_sources(
             workspace=workspace,
             configuration=configuration,
@@ -923,6 +1204,9 @@ def build_command(args: argparse.Namespace) -> int:
             compiler_tag=compiler_tag,
         )
         if args.qtifw_output:
+            log_message(
+                f"Generating QtIFW overlay into {args.qtifw_output.resolve()}"
+            )
             generate_qtifw_overlay(
                 workspace=workspace,
                 configuration=configuration,
@@ -948,8 +1232,10 @@ def package_selected_sources(
     source_names: Iterable[str],
     compiler_tag: str,
 ) -> None:
-    for source_name in sorted(source_names):
+    source_name_list = sorted(source_names)
+    for source_name in iter_with_progress(source_name_list, "package"):
         recipe = workspace.recipes[source_name]
+        log_message(f"Packaging source recipe {source_name}")
         package_source_recipe(
             recipe=recipe,
             configuration=configuration,
@@ -979,10 +1265,12 @@ def package_msi(
     environment["PKGS"] = " ".join(sorted(msi_sources))
     if mirror:
         environment["mirror"] = mirror
+    log_message(f"Building MSI packages for: {' '.join(sorted(msi_sources))}")
     run_command(
         ["bash", "scripts/msis.sh"],
         cwd=root_dir,
         environment=environment,
+        description="Executing MSI packaging pipeline",
     )
 
 
@@ -1014,8 +1302,12 @@ def snapshot_command(args: argparse.Namespace) -> int:
     root_dir = args.root.resolve()
     configuration = BridgeConfiguration.load(args.config.resolve())
     workspace = WorkspaceModel.discover(root_dir)
+    log_message(
+        f"Generating snapshot for {len(workspace.recipes)} source recipes"
+    )
     snapshot = workspace.snapshot(configuration)
     write_snapshot_file(snapshot, args.output.resolve())
+    log_message(f"Snapshot written to {args.output.resolve()}")
     return 0
 
 
@@ -1029,6 +1321,9 @@ def changes_command(args: argparse.Namespace) -> int:
         workspace=workspace,
         configuration=configuration,
         tag_name=args.tag,
+    )
+    log_message(
+        f"Detected {len(changed_names)} changed packages since tag {args.tag}"
     )
     if args.output_format == "json":
         print(json.dumps(changed_names, indent=2))
@@ -1049,6 +1344,9 @@ def package_command(args: argparse.Namespace) -> int:
     else:
         source_names = workspace.source_names()
     compiler_tag = args.compiler_tag or detect_compiler_tag()
+    log_message(
+        f"Packaging {len(source_names)} repositories from {args.release_root.resolve()}"
+    )
     package_selected_sources(
         workspace=workspace,
         configuration=configuration,
@@ -1077,6 +1375,9 @@ def qtifw_command(args: argparse.Namespace) -> int:
                 / configuration.describe(recipe.name, recipe.package_names).repo_name
             ).exists()
         }
+    log_message(
+        f"Generating QtIFW metadata for {len(source_names)} repositories"
+    )
     generate_qtifw_overlay(
         workspace=workspace,
         configuration=configuration,
@@ -1122,6 +1423,22 @@ def build_parser() -> argparse.ArgumentParser:
         "--cygwin-setup",
         type=Path,
         help="Path to a cached setup-x86_64.exe executable.",
+    )
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Suppress wrapper logs and child process output.",
+    )
+    parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable tqdm progress bars even when tqdm is available.",
+    )
+    parser.add_argument(
+        "--heartbeat-seconds",
+        type=int,
+        default=60,
+        help="Emit a heartbeat message if a child process stays silent for N seconds.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -1299,6 +1616,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    configure_logging(args)
     return int(args.handler(args))
 
 

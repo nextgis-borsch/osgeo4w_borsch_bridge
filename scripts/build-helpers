@@ -13,6 +13,9 @@ export OSGEO4W_PWD=$PWD
 
 export CCACHE_CACHE_SIZE=50G
 
+: ${OSGEO4W_VERBOSE:=1}
+: ${OSGEO4W_QUIET:=0}
+
 : ${PYTHON:=Python312}
 export PYTHON
 export OSGEO4W_HINTS=0
@@ -32,10 +35,24 @@ declare -x log
 
 startlog() {
 	log_failed=0
-	echo "Local package repository: $OSGEO4W_REP"
-	echo "Logging to $OSGEO4W_PWD/package.log"
 	savelog package.log
-	exec > >(tee package.log) 2>&1
+	if [ "$OSGEO4W_QUIET" = "1" ]; then
+		exec >>package.log 2>&1
+	else
+		exec > >(tee package.log) 2>&1
+	fi
+
+	log "Local package repository: $OSGEO4W_REP"
+	log "Logging to $OSGEO4W_PWD/package.log"
+	log "Package: ${P:-unknown}"
+	log "Package directory: $PWD"
+	log "Initial upstream version: ${V:-unknown}"
+	log "Initial binary selector: ${B:-unknown}"
+	log "Build dependencies: ${BUILDDEPENDS:-none}"
+	log "Python runtime: $PYTHON"
+	log "Operating system: $(uname -a)"
+	log "Bash: $(bash --version | head -1)"
+	log "Git: $(git --version)"
 
 	export PATH=$(cygpath -S):$(cygpath -W):$(cygpath -S)/WBem:/bin:/usr/bin
 	log "Starting with clean PATH: $PATH"
@@ -50,8 +67,10 @@ startlog() {
 	fi
 
 	[ "$BUILDDEPENDS" == "none" ] || {
+		log "Fetching build dependencies: $BUILDDEPENDS"
 		fetchdeps $BUILDDEPENDS
 		export RUNTIMEDEPENDS=$(runtimedepends $BUILDDEPENDS)
+		log "Resolved runtime dependencies: ${RUNTIMEDEPENDS:-none}"
 	}
 
 	trap 'errlog $LINENO $?' ERR
@@ -231,7 +250,8 @@ declare -x vs2019env
 fileversion() {
 	local ps="$(cygpath -a --sysdir)/WindowsPowerShell/v1.0/powershell.exe"
 	local v=$($ps -Command "(Get-Item \"$(cygpath -aw "$1")\").VersionInfo.ProductVersion")
-	v=${v%}
+	v=${v%
+}
 	echo $v
 }
 declare -x fileversion
@@ -311,11 +331,13 @@ vs2022env() {
 
 	export VSLANG=1033
 	export VS170COMNTOOLS=$(cygpath -aw "$vcdir")/Common7/Tools
+	log "Visual Studio root: $vcdir"
 	fetchenv "$vcdir/VC/Auxiliary/Build/vcvarsall.bat" ${VCARCH:-amd64} ${VCSDK:-}
 	export PATH="$vcdir/VC/bin:$PATH"
 	export CC=cl.exe
 	export CXX=cl.exe
-	type -a $CC $CXX
+	log "Compiler executables: $(type -p $CC) $(type -p $CXX)"
+	log "Compiler banner: $(cl 2>&1 | sed -n '1,2p' | tr '\r\n' ' ' | sed 's/[[:space:]]\+/ /g')"
 
 	(
 		cd /tmp
@@ -384,6 +406,7 @@ cmakeenv() {
 	CMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH%;}
 
 	log CMAKE_PREFIX_PATH:$CMAKE_PREFIX_PATH
+	log "CMake: $(cmake.exe --version | head -1)"
 	export CMAKE_PREFIX_PATH
 }
 declare -x cmakeenv
@@ -420,6 +443,8 @@ ninjaenv() {
 	if ! type -p ninja.exe >/dev/null; then
 		export PATH="$OSGEO4W_SCRIPTS:$PATH"
 	fi
+
+	log "Ninja: $(ninja.exe --version)"
 }
 declare -x ninjaenv
 
@@ -449,6 +474,7 @@ ccacheenv() {
 declare -x ccacheenv
 
 regen() {
+	log "Regenerating local setup.ini and license metadata"
 	(
 		! [ -f /tmp/setup-master.ini ] || exec 2> >(egrep -v "^warning: package [^ ]* requires an unknown package '($(sed -ne "s/^@ //p" /tmp/setup-master.ini| paste -d"|" -s))'$" >&2)
 
@@ -489,6 +515,8 @@ declare -x setuppid
 fetchdeps() {
 	local p missing
 
+	log "Ensuring dependencies are installed: $*"
+
 	if [ -d "$OSGEO4W_PWD/osgeo4w" ]; then
 		missing=
 		for p in "$@"; do
@@ -508,6 +536,7 @@ fetchdeps() {
 	fi
 
 	if ! [ -x "$OSGEO4W_SCRIPTS/osgeo4w-setup.exe" ]; then
+		log "Downloading osgeo4w-setup.exe"
 		curl --output "$OSGEO4W_SCRIPTS/osgeo4w-setup.exe" $MASTER_REPO/osgeo4w-setup.exe
 		chmod a+x "$OSGEO4W_SCRIPTS/osgeo4w-setup.exe"
 	fi
@@ -596,6 +625,8 @@ availablepackageversions() {
 		return 1
 	fi
 
+	log "Checking published versions for $p"
+
 	curl -s --output /tmp/setup-master.ini $MASTER_REPO/x86_64/setup.ini
 
 	regen 1>&2
@@ -656,6 +687,8 @@ nextbinary() {
 		: ${OSGEO4W_BUILDMODE:=test}
 		;;
 	esac
+
+	log "Selecting binary version for $p with upstream version $V"
 
 	availablepackageversions $p
 
