@@ -67,6 +67,7 @@ LOGGING_SETTINGS = LoggingSettings()
 LOGGER_NAMESPACE = "osgeo4w_borsch_bridge"
 LOGGER = logging.getLogger(f"{LOGGER_NAMESPACE}.pipeline")
 PROCESS_LOGGER = logging.getLogger(f"{LOGGER_NAMESPACE}.process")
+SHELL_LOG_PREFIX = "\x1eOSGEO4W_BRIDGE_LOG\x1f"
 
 
 class TqdmLoggingHandler(logging.StreamHandler):
@@ -370,6 +371,22 @@ def iter_with_progress(
     )
 
 
+def parse_shell_log_frame(
+    line: str,
+) -> Optional[Tuple[str, int, str]]:
+    if not line.startswith(SHELL_LOG_PREFIX):
+        return None
+    payload = line[len(SHELL_LOG_PREFIX):].rstrip("\r\n")
+    parts = payload.split("\x1f", 2)
+    if len(parts) != 3:
+        return None
+    logger_name, level_name, message = parts
+    if not logger_name:
+        return None
+    level = getattr(logging, level_name.upper(), logging.INFO)
+    return logger_name, int(level), message
+
+
 def stream_subprocess_output(
     args: Sequence[str],
     cwd: Path,
@@ -449,6 +466,11 @@ def stream_subprocess_output(
         heartbeat_deadline = (
             time.monotonic() + LOGGING_SETTINGS.heartbeat_seconds
         )
+        shell_log_frame = parse_shell_log_frame(line)
+        if shell_log_frame is not None:
+            logger_name, level, message = shell_log_frame
+            logging.getLogger(logger_name).log(level, message)
+            continue
         if stream_name == "stdout":
             stdout_lines.append(line)
             sys.stdout.write(line)
@@ -1132,6 +1154,7 @@ def xml_escape(value: str) -> str:
 
 def build_environment(args: argparse.Namespace) -> Dict[str, str]:
     environment: Dict[str, str] = {}
+    environment["OSGEO4W_BRIDGE_LOG_PROTOCOL"] = "1"
     if not args.build_reverse_dependencies:
         environment["OSGEO4W_BUILD_RDEPS"] = "0"
     if args.continue_on_error:

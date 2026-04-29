@@ -20,6 +20,12 @@ export CCACHE_CACHE_SIZE=50G
 export PYTHON
 export OSGEO4W_HINTS=0
 
+if [ "${OSGEO4W_BRIDGE_LOG_PROTOCOL:-0}" = "1" ]; then
+	if ! (: >&3) 2>/dev/null; then
+		exec 3>&1
+	fi
+fi
+
 savelog() {
 	local f=$1
 	rm -f $f.9
@@ -29,6 +35,14 @@ savelog() {
 declare -x savelog
 
 log() {
+	if [ "${OSGEO4W_BRIDGE_LOG_PROTOCOL:-0}" = "1" ]; then
+		local message="$*"
+		if [ -n "${OSGEO4W_PACKAGE_LOG:-}" ]; then
+			printf '%s: %s\n' "$(date +"%Y-%m-%d %H:%M:%S")" "$message" >>"$OSGEO4W_PACKAGE_LOG"
+		fi
+		printf '\036OSGEO4W_BRIDGE_LOG\037osgeo4w_borsch_bridge.build-helpers\037INFO\037%s\n' "$message" >&3
+		return
+	fi
 	echo "$(date +"%Y-%m-%d %H:%M:%S"): $*"
 }
 declare -x log
@@ -36,6 +50,7 @@ declare -x log
 startlog() {
 	log_failed=0
 	savelog package.log
+	export OSGEO4W_PACKAGE_LOG="$PWD/package.log"
 	if [ "$OSGEO4W_QUIET" = "1" ]; then
 		exec >>package.log 2>&1
 	else
@@ -249,7 +264,7 @@ declare -x vs2019env
 
 fileversion() {
 	local ps="$(cygpath -a --sysdir)/WindowsPowerShell/v1.0/powershell.exe"
-	local v=$($ps -Command "(Get-Item \"$(cygpath -aw "$1")\").VersionInfo.ProductVersion")
+	local v=$($ps -NoLogo -NoProfile -NonInteractive -Command "(Get-Item \"$(cygpath -aw "$1")\").VersionInfo.ProductVersion")
 	v=${v%
 }
 	echo $v

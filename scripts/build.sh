@@ -8,7 +8,17 @@ export PATH=/bin:/usr/bin
 : ${OSGEO4W_VERBOSE:=1}
 : ${OSGEO4W_QUIET:=0}
 
+if [ "${OSGEO4W_BRIDGE_LOG_PROTOCOL:-0}" = "1" ]; then
+	if ! (: >&3) 2>/dev/null; then
+		exec 3>&1
+	fi
+fi
+
 log() {
+	if [ "${OSGEO4W_BRIDGE_LOG_PROTOCOL:-0}" = "1" ]; then
+		printf '\036OSGEO4W_BRIDGE_LOG\037osgeo4w_borsch_bridge.build.sh\037INFO\037%s\n' "$*" >&3
+		return
+	fi
 	echo "$(date +"%Y-%m-%d %H:%M:%S"): $*"
 }
 
