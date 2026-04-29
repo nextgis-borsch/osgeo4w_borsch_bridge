@@ -116,6 +116,15 @@ Build everything from source and ignore repka hydration completely:
 python3 scripts/nextgis.py build --ignore-repka
 ```
 
+Allow explicit fallback to OSGeo4W for dependencies that are neither available
+locally nor via repka:
+
+```bash
+python3 scripts/nextgis.py build \
+  curl \
+  --allow-osgeo4w-deps
+```
+
 Request MSI output through the legacy MSI pipeline:
 
 ```bash
@@ -123,6 +132,14 @@ python3 scripts/nextgis.py build \
   nextgisqgis \
   --packaging-backend both \
   --msi-mirror https://download.osgeo.org/osgeo4w/v2
+```
+
+Clean untracked build outputs:
+
+```bash
+python3 scripts/nextgis.py clean --src
+python3 scripts/nextgis.py clean --artifacts
+python3 scripts/nextgis.py clean --full
 ```
 
 ## Source-of-Truth Rules
@@ -166,6 +183,9 @@ packages:
 - The build recipes still assume the existing OSGeo4W and MSVC environment.
 - `scripts/nextgis.py` is orchestration only. It does not replace
   `scripts/build.sh`; it drives it.
+- Build dependency fallback to the public OSGeo4W repository is disabled by
+  default. Use `--allow-osgeo4w-deps` when that behavior is required
+  explicitly.
 - Compiler-tagged ZIP names can be overridden with `--compiler-tag` or the
   `NEXTGIS_COMPILER_TAG` environment variable.
 - Repka hydration can use either a local directory or an HTTP root containing

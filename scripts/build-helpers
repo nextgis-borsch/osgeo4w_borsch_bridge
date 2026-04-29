@@ -271,6 +271,27 @@ fileversion() {
 }
 declare -x fileversion
 
+append_cl_flag() {
+	local flag=$1
+	if [ -z "$flag" ]; then
+		return 0
+	fi
+
+	if [ -z "${CL:-}" ]; then
+		export CL="$flag"
+		return 0
+	fi
+
+	case " $CL " in
+	*" $flag "*)
+		;;
+	*)
+		export CL="$flag $CL"
+		;;
+	esac
+}
+declare -x append_cl_flag
+
 vs2022env() {
 	local e vcdir candidate install_path
 
@@ -368,19 +389,8 @@ vs2022env() {
 	export PATH="$vcdir/VC/bin:$PATH"
 	export CC=cl.exe
 	export CXX=cl.exe
-	# Do not patch MSVC STL headers in-place (usually under Program Files).
-	# Use CL env var to inject the required macro globally.
-	if [ -z "${CL:-}" ]; then
-		export CL="/D_DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR"
-	else
-		case " $CL " in
-		*" /D_DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR "*)
-			;;
-		*)
-			export CL="/D_DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR $CL"
-			;;
-		esac
-	fi
+	append_cl_flag "/D_DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR"
+	log "Global CL flags: ${CL:-none}"
 	log "Compiler executables: $(type -p $CC) $(type -p $CXX)"
 	log "Compiler banner: $(cl 2>&1 | sed -n '1,2p' | tr '\r\n' ' ' | sed 's/[[:space:]]\+/ /g')"
 }

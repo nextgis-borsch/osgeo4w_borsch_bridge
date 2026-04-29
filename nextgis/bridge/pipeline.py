@@ -5,6 +5,7 @@ import gzip
 import hashlib
 import io
 import json
+import locale
 import logging
 import os
 import platform
@@ -350,6 +351,13 @@ def format_command(args: Sequence[str]) -> str:
     return " ".join(str(argument) for argument in args)
 
 
+def preferred_subprocess_encoding() -> str:
+    encoding = locale.getpreferredencoding(False)
+    if encoding:
+        return encoding
+    return "utf-8"
+
+
 def first_output_line(output_text: str) -> str:
     for line in output_text.splitlines():
         stripped_line = line.strip()
@@ -418,14 +426,17 @@ def stream_subprocess_output(
         cwd=str(cwd),
         env=merged_environment,
         text=True,
+        encoding=preferred_subprocess_encoding(),
+        errors="replace",
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         bufsize=1,
     )
-    output_queue: Queue[Tuple[str, Optional[str]]] = Queue()
+    output_queue: Queue[Tuple[str, Optional[str], Optional[Exception]]] = Queue()
     stdout_lines: List[str] = []
     stderr_lines: List[str] = []
     stderr_buffer: List[str] = []
+    stream_error: Optional[RuntimeError] = None
 
     def flush_stderr_buffer() -> None:
         if not stderr_buffer:
@@ -437,11 +448,20 @@ def stream_subprocess_output(
 
     def read_stream(stream_name: str, stream: Optional[IO[str]]) -> None:
         if stream is None:
-            output_queue.put((stream_name, None))
+            output_queue.put((stream_name, None, None))
             return
-        for line in stream:
-            output_queue.put((stream_name, line))
-        output_queue.put((stream_name, None))
+        try:
+            for line in stream:
+                output_queue.put((stream_name, line, None))
+        except Exception as error:
+            output_queue.put((stream_name, None, error))
+            return
+        finally:
+            try:
+                stream.close()
+            except OSError:
+                pass
+        output_queue.put((stream_name, None, None))
 
     stdout_thread = threading.Thread(
         target=read_stream,
@@ -460,7 +480,7 @@ def stream_subprocess_output(
 
     while len(completed_streams) < 2:
         try:
-            stream_name, line = output_queue.get(timeout=1.0)
+            stream_name, line, stream_read_error = output_queue.get(timeout=1.0)
         except Empty:
             if process.poll() is not None and output_queue.empty():
                 flush_stderr_buffer()
@@ -471,6 +491,20 @@ def stream_subprocess_output(
                     time.monotonic() + LOGGING_SETTINGS.heartbeat_seconds
                 )
             continue
+
+        if stream_read_error is not None:
+            if stream_name == "stderr":
+                flush_stderr_buffer()
+            completed_streams.add(stream_name)
+            error_message = (
+                f"Failed to read {stream_name} from child process "
+                f"{description}: {stream_read_error}"
+            )
+            PROCESS_LOGGER.error(error_message)
+            if process.poll() is None:
+                process.kill()
+            stream_error = RuntimeError(error_message)
+            break
 
         if line is None:
             if stream_name == "stderr":
@@ -498,12 +532,14 @@ def stream_subprocess_output(
         stderr_buffer.append(line)
 
     flush_stderr_buffer()
-    stdout_thread.join(timeout=0)
-    stderr_thread.join(timeout=0)
+    stdout_thread.join(timeout=0.1)
+    stderr_thread.join(timeout=0.1)
 
     return_code = process.wait()
     stdout_text = "".join(stdout_lines)
     stderr_text = "".join(stderr_lines)
+    if stream_error is not None:
+        raise stream_error
     if return_code != 0:
         raise subprocess.CalledProcessError(
             return_code,
@@ -547,6 +583,8 @@ def run_command(
             cwd=str(cwd),
             env=merged_environment,
             text=True,
+            encoding=preferred_subprocess_encoding(),
+            errors="replace",
             check=True,
             capture_output=True,
         )
@@ -579,6 +617,8 @@ def capture_optional_command(
             cwd=str(cwd),
             env=merged_environment,
             text=True,
+            encoding=preferred_subprocess_encoding(),
+            errors="replace",
             check=False,
             capture_output=True,
         )
@@ -614,6 +654,10 @@ def log_build_environment_summary(
         "Paths: "
         f"release={effective_release_root}, "
         f"artifacts={args.artifacts_root.resolve()}"
+    )
+    LOGGER.info(
+        "OSGeo4W dependency fallback: "
+        f"{'enabled' if args.allow_osgeo4w_deps else 'disabled'}"
     )
 
     bash_version = capture_optional_command(["bash", "--version"], root_dir)
@@ -1362,6 +1406,171 @@ def write_hydration_markers(install_root: Path, recipe: SourceRecipe) -> None:
             file_handle.write(f"hydrated:{recipe.name}\n")
 
 
+def setup_marker_path(install_root: Path, package_name: str) -> Path:
+    return install_root / "etc" / "setup" / f"{package_name}.lst.gz"
+
+
+def has_installed_dependency(install_root: Path, package_name: str) -> bool:
+    return setup_marker_path(install_root, package_name).exists()
+
+
+def has_local_release_archive(repo_root: Path, package_name: str) -> bool:
+    release_root = repo_root / "x86_64" / "release"
+    if not release_root.exists():
+        return False
+    for archive_path in release_root.rglob(f"{package_name}-*.tar.bz2"):
+        if archive_path.name.endswith("-src.tar.bz2"):
+            continue
+        return True
+    return False
+
+
+def is_dependency_satisfied(
+    package_name: str,
+    workspace: WorkspaceModel,
+    planned_sources: Set[str],
+    install_root: Path,
+    repo_root: Path,
+) -> bool:
+    if has_installed_dependency(install_root, package_name):
+        return True
+    if has_local_release_archive(repo_root, package_name):
+        return True
+    dependency_source = workspace.package_to_source.get(package_name)
+    if dependency_source is None:
+        return False
+    return dependency_source in planned_sources
+
+
+def resolve_planned_dependency_sources(
+    workspace: WorkspaceModel,
+    configuration: BridgeConfiguration,
+    selected_sources: Sequence[str],
+    disabled: Set[str],
+    install_root: Path,
+    repo_root: Path,
+    repka_root: str,
+    allow_osgeo4w_deps: bool,
+) -> List[str]:
+    planned_sources = set(selected_sources)
+    hydrated_sources: Set[str] = set()
+    repka_enabled = bool(repka_root)
+
+    while True:
+        added_sources: Set[str] = set()
+        for source_name in sorted(planned_sources):
+            recipe = workspace.recipes[source_name]
+            for package_name in recipe.build_depends:
+                if is_dependency_satisfied(
+                    package_name=package_name,
+                    workspace=workspace,
+                    planned_sources=planned_sources,
+                    install_root=install_root,
+                    repo_root=repo_root,
+                ):
+                    continue
+
+                dependency_source = workspace.package_to_source.get(package_name)
+                if dependency_source is None:
+                    continue
+                if dependency_source in disabled:
+                    raise RuntimeError(
+                        f"Dependency {package_name} required by {source_name} "
+                        f"is disabled via source {dependency_source}"
+                    )
+                if dependency_source in planned_sources:
+                    continue
+
+                if repka_enabled and dependency_source not in hydrated_sources:
+                    dependency_recipe = workspace.recipes[dependency_source]
+                    can_hydrate, reason = can_hydrate_source_recipe(
+                        recipe=dependency_recipe,
+                        configuration=configuration,
+                        artifacts_root=repka_root,
+                    )
+                    if can_hydrate:
+                        LOGGER.info(
+                            "Hydrating dependency source "
+                            f"{dependency_source} from repka for {package_name}"
+                        )
+                        hydrate_source_recipe(
+                            recipe=dependency_recipe,
+                            configuration=configuration,
+                            artifacts_root=repka_root,
+                            install_root=install_root,
+                        )
+                        hydrated_sources.add(dependency_source)
+                        continue
+                    LOGGER.info(
+                        "Scheduling dependency source build for "
+                        f"{dependency_source}: {reason}"
+                    )
+
+                added_sources.add(dependency_source)
+
+        if not added_sources:
+            break
+        planned_sources.update(added_sources)
+
+    unresolved_internal: Set[str] = set()
+    unresolved_external: Set[str] = set()
+    for source_name in sorted(planned_sources):
+        recipe = workspace.recipes[source_name]
+        for package_name in recipe.build_depends:
+            if is_dependency_satisfied(
+                package_name=package_name,
+                workspace=workspace,
+                planned_sources=planned_sources,
+                install_root=install_root,
+                repo_root=repo_root,
+            ):
+                continue
+
+            dependency_source = workspace.package_to_source.get(package_name)
+            if dependency_source is None:
+                unresolved_external.add(package_name)
+                continue
+            unresolved_internal.add(
+                f"{package_name} via source {dependency_source}"
+            )
+
+    if unresolved_internal:
+        unresolved_text = ", ".join(sorted(unresolved_internal))
+        raise RuntimeError(
+            "Dependency preflight did not resolve in-workspace dependencies: "
+            f"{unresolved_text}"
+        )
+
+    if unresolved_external:
+        unresolved_text = " ".join(sorted(unresolved_external))
+        if allow_osgeo4w_deps:
+            LOGGER.info(
+                "Allowing OSGeo4W fallback for unresolved external "
+                f"dependencies: {unresolved_text}"
+            )
+        else:
+            raise RuntimeError(
+                "Missing external build dependencies are not available "
+                f"locally or via repka: {unresolved_text}. "
+                "Rerun with --allow-osgeo4w-deps to fetch them from "
+                "OSGeo4W explicitly."
+            )
+
+    extra_sources = sorted(planned_sources.difference(selected_sources))
+    if extra_sources:
+        LOGGER.info(
+            "Dependency preflight added source builds: "
+            f"{' '.join(extra_sources)}"
+        )
+    if hydrated_sources:
+        LOGGER.info(
+            "Hydrated dependency sources from repka: "
+            f"{' '.join(sorted(hydrated_sources))}"
+        )
+
+    return sorted(planned_sources)
+
+
 def generate_qtifw_overlay(
     workspace: WorkspaceModel,
     configuration: BridgeConfiguration,
@@ -1513,6 +1722,10 @@ def build_environment(args: argparse.Namespace) -> Dict[str, str]:
         environment["OSGEO4W_BUILD_RDEPS"] = "0"
     if args.continue_on_error:
         environment["OSGEO4W_CONTINUE_BUILD"] = "1"
+    if not args.allow_osgeo4w_deps:
+        environment["OSGEO4W_SKIP_MASTER_REPO"] = "1"
+    if args.repka_root and not args.ignore_repka:
+        environment["OSGEO4W_SKIP_UPDATE"] = "1"
     environment["OSGEO4W_REP"] = format_path_for_runtime(
         resolve_osgeo4w_repo(root_dir, args)
     )
@@ -1606,53 +1819,31 @@ def build_command(args: argparse.Namespace) -> int:
         disabled=disabled,
     )
     LOGGER.info(
-        f"Build plan contains {len(build_targets)} packages; backend={args.packaging_backend}"
+        "Initial build plan contains "
+        f"{len(build_targets)} packages; backend={args.packaging_backend}"
     )
     if build_targets:
-        LOGGER.info(f"Build targets: {' '.join(build_targets)}")
+        LOGGER.info(f"Initial build targets: {' '.join(build_targets)}")
+
     environment = build_environment(args)
-    if args.repka_root and not args.ignore_repka:
-        bootstrap_names = workspace.bootstrap_sources(
-            target_names=build_targets,
-            disabled=disabled,
-        )
-        build_target_set = set(build_targets)
-        osgeo4w_root = ensure_osgeo4w_root(root_dir)
-        LOGGER.info(
-            f"Hydrating {len(bootstrap_names)} dependency repositories into {osgeo4w_root}"
-        )
-        for source_name in iter_with_progress(
-            bootstrap_names,
-            "hydrate",
-        ):
-            recipe = workspace.recipes[source_name]
-            can_hydrate, reason = can_hydrate_source_recipe(
-                recipe=recipe,
-                configuration=configuration,
-                artifacts_root=args.repka_root,
-            )
-            if can_hydrate:
-                hydrate_source_recipe(
-                    recipe=recipe,
-                    configuration=configuration,
-                    artifacts_root=args.repka_root,
-                    install_root=osgeo4w_root,
-                )
-                continue
-            LOGGER.info(
-                f"Scheduling dependency source build for {source_name}: {reason}"
-            )
-            build_target_set.add(source_name)
-        build_targets = workspace.build_targets(
-            names=sorted(build_target_set),
-            include_reverse_dependencies=args.build_reverse_dependencies,
-            disabled=disabled,
-        )
-        LOGGER.info(
-            f"Expanded build plan contains {len(build_targets)} packages after repka check"
-        )
-        environment["OSGEO4W_SKIP_UPDATE"] = "1"
-        environment["OSGEO4W_SKIP_MASTER_REPO"] = "1"
+
+    osgeo4w_root = ensure_osgeo4w_root(root_dir)
+    build_targets = resolve_planned_dependency_sources(
+        workspace=workspace,
+        configuration=configuration,
+        selected_sources=build_targets,
+        disabled=disabled,
+        install_root=osgeo4w_root,
+        repo_root=resolve_osgeo4w_repo(root_dir, args),
+        repka_root=args.repka_root if not args.ignore_repka else "",
+        allow_osgeo4w_deps=args.allow_osgeo4w_deps,
+    )
+    LOGGER.info(
+        f"Resolved build plan contains {len(build_targets)} packages"
+    )
+    if build_targets:
+        LOGGER.info(f"Resolved build targets: {' '.join(build_targets)}")
+
     build_arguments = build_targets + [f"{name}-" for name in sorted(disabled)]
     if build_arguments:
         run_command(
@@ -1861,6 +2052,47 @@ def qtifw_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def clean_command(args: argparse.Namespace) -> int:
+    root_dir = args.root.resolve()
+    clean_paths: List[Path] = []
+    scope_label = "full"
+    if args.src:
+        scope_label = "src"
+        clean_paths = [root_dir / "src"]
+    elif args.artifacts:
+        scope_label = "artifacts"
+        clean_paths = [
+            root_dir / "tmp",
+            root_dir / "x86_64",
+            root_dir / "nextgis" / "artifacts",
+        ]
+
+    existing_paths = [path for path in clean_paths if path.exists()]
+    if scope_label != "full" and not existing_paths:
+        LOGGER.info(f"Nothing to clean for scope {scope_label}")
+        return 0
+
+    command = ["git", "clean", "-fdx"]
+    if args.dry_run:
+        command.append("-n")
+    if scope_label != "full":
+        command.append("--")
+        command.extend(
+            path.relative_to(root_dir).as_posix() for path in existing_paths
+        )
+
+    LOGGER.info(
+        f"Cleaning scope {scope_label}"
+        + (" in dry-run mode" if args.dry_run else "")
+    )
+    run_command(
+        command,
+        cwd=root_dir,
+        description="Cleaning untracked repository files",
+    )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="NextGIS bridge orchestration for OSGeo4W, repka and QtIFW."
@@ -1958,6 +2190,33 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output format.",
     )
     changes_parser.set_defaults(handler=changes_command)
+
+    clean_parser = subparsers.add_parser(
+        "clean",
+        help="Remove untracked build outputs from the repository.",
+    )
+    clean_scope = clean_parser.add_mutually_exclusive_group(required=True)
+    clean_scope.add_argument(
+        "--src",
+        action="store_true",
+        help="Clean untracked files under src/.",
+    )
+    clean_scope.add_argument(
+        "--artifacts",
+        action="store_true",
+        help="Clean tmp/, x86_64/ and nextgis/artifacts/.",
+    )
+    clean_scope.add_argument(
+        "--full",
+        action="store_true",
+        help="Clean untracked files across the entire repository.",
+    )
+    clean_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would be removed without deleting it.",
+    )
+    clean_parser.set_defaults(handler=clean_command)
 
     package_parser = subparsers.add_parser(
         "package",
@@ -2077,6 +2336,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--ignore-repka",
         action="store_true",
         help="Ignore repka artifacts even if repka root is provided.",
+    )
+    build_parser_obj.add_argument(
+        "--allow-osgeo4w-deps",
+        action="store_true",
+        help=(
+            "Allow unresolved external dependencies to be fetched from "
+            "OSGeo4W via osgeo4w-setup.exe."
+        ),
     )
     build_parser_obj.add_argument(
         "--compiler-tag",
