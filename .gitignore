@@ -224,6 +224,8 @@ __marimo__/
 # OSGEO4W
 cygwin/
 scripts/*.exe
+scripts/*.zip
+scripts/cmake
 tmp/
 *.tar.gz
 package.log.*
@@ -231,3 +233,4 @@ scripts/vs2019
 scripts/vs2022
 
 src/*/*-[0-9]*/
+src/*/osgeo4w/install
