@@ -89,6 +89,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Install a local Cygwin runtime for NextGIS bridge commands.",
     )
     bootstrap_parser.add_argument(
+        "-f",
         "--force",
         action="store_true",
         help="Redownload setup-x86_64.exe before running the installer.",
@@ -97,9 +98,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     snapshot_parser = subparsers.add_parser("snapshot", help="Write build snapshot.")
     snapshot_parser.add_argument(
+        "-o",
         "--output",
         type=Path,
-        required=True,
+        default=Path("nextgis/state/build-manifest.json"),
         help="Snapshot file path.",
     )
     snapshot_parser.set_defaults(handler=snapshot_command)
@@ -108,8 +110,9 @@ def build_parser() -> argparse.ArgumentParser:
         "changes",
         help="List changed packages since a git tag.",
     )
-    changes_parser.add_argument("--tag", required=True, help="Git tag name.")
+    changes_parser.add_argument("-t", "--tag", required=True, help="Git tag name.")
     changes_parser.add_argument(
+        "-f",
         "--output-format",
         choices=["text", "json"],
         default="text",
@@ -157,18 +160,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="Source package names or binary package names.",
     )
     package_parser.add_argument(
+        "-r",
         "--release-root",
         type=Path,
         default=Path("x86_64/release"),
         help="OSGeo4W release root.",
     )
     package_parser.add_argument(
+        "-a",
         "--artifacts-root",
         type=Path,
-        required=True,
+        default=Path("nextgis/artifacts"),
         help="Output root for repka-compatible repositories.",
     )
     package_parser.add_argument(
+        "-c",
         "--compiler-tag",
         default="",
         help="Explicit compiler tag used in archive names.",
@@ -185,18 +191,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="Source package names or binary package names.",
     )
     qtifw_parser.add_argument(
+        "-r",
         "--release-root",
         type=Path,
         default=Path("x86_64/release"),
         help="OSGeo4W release root used for setup.hint and license metadata.",
     )
     qtifw_parser.add_argument(
+        "-a",
         "--artifacts-root",
         type=Path,
         default=Path("nextgis/artifacts"),
         help="Repka-compatible artifacts root.",
     )
     qtifw_parser.add_argument(
+        "-o",
         "--output",
         type=Path,
         default=Path("nextgis/qtifw"),
@@ -214,12 +223,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Source package names or binary package names.",
     )
     build_parser_obj.add_argument(
+        "-d",
         "--disable",
         action="append",
         default=[],
         help="Disable a source recipe or binary package from the build graph.",
     )
     build_parser_obj.add_argument(
+        "-t",
         "--changed-since-tag",
         default="",
         help="Build only packages changed since the provided tag.",
@@ -235,34 +246,40 @@ def build_parser() -> argparse.ArgumentParser:
         help="Continue the build if a package fails.",
     )
     build_parser_obj.add_argument(
+        "-r",
         "--release-root",
         type=Path,
         default=Path("x86_64/release"),
         help="OSGeo4W release root.",
     )
     build_parser_obj.add_argument(
+        "-a",
         "--artifacts-root",
         type=Path,
         default=Path("nextgis/artifacts"),
         help="Output root for repka-compatible repositories.",
     )
     build_parser_obj.add_argument(
+        "-q",
         "--qtifw-output",
         type=Path,
         help="Output directory for generated QtIFW overlay.",
     )
     build_parser_obj.add_argument(
+        "-s",
         "--snapshot-output",
         type=Path,
         help="Write a build snapshot after the build.",
     )
     build_parser_obj.add_argument(
+        "-p",
         "--packaging-backend",
         choices=["none", "borsch", "msi", "both"],
         default="borsch",
         help="Packaging backend selection.",
     )
     build_parser_obj.add_argument(
+        "-k",
         "--repka-root",
         default="",
         help="Local path or HTTP root with repka-compatible artifacts.",
@@ -281,6 +298,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     build_parser_obj.add_argument(
+        "-c",
         "--compiler-tag",
         default="",
         help="Explicit compiler tag used in archive names.",
@@ -291,6 +309,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Explicit local OSGeo4W repository path.",
     )
     build_parser_obj.add_argument(
+        "-m",
         "--msi-mirror",
         default="",
         help="Mirror path or URL passed to scripts/msis.sh.",

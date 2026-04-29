@@ -981,7 +981,6 @@ def package_source_recipe(
             zip_path=build_dir / f"{archive_bases[0]}.zip",
             archive_base=archive_bases[0],
         )
-        copy_directory_contents(main_stage_root, repo_root)
         if runtime_packages and devel_packages:
             devel_stage_root = stage_selected_archives(
                 archive_paths=[
@@ -1629,7 +1628,7 @@ def stage_qtifw_license_files(
             target_name = f"{license_path.stem}-{index}{license_path.suffix}"
         shutil.copy2(license_path, meta_dir / target_name)
         used_names.add(target_name)
-        license_name = f"{component.component_id} license"
+        license_name = "License Agreement"
         if len(package_metadata.license_files) > 1:
             license_name = f"{license_name} {index}"
         license_entries.append((license_name, target_name))

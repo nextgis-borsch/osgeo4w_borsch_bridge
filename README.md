@@ -50,6 +50,9 @@ The bridge repacks those outputs into a repka-compatible repository root:
 - when OSGeo4W emits a `-devel` package, one additional compiler-tagged ZIP
   such as `openjpeg-devel-2.5.4-MSVC-19.38-64bit.zip`
 
+The repacked repository keeps published archives and metadata under `build/`.
+It does not keep a second exploded copy of the install tree next to them.
+
 This is why the mapping file is mandatory: one NextGIS repository may be built
 from several OSGeo4W binary packages, and QtIFW components may consume only a
 subset of the repacked files.
@@ -61,8 +64,7 @@ Run all commands from the repository root.
 Create a build snapshot:
 
 ```bash
-python3 scripts/borsch.py snapshot \
-  --output nextgis/state/build-manifest.json
+python3 scripts/borsch.py snapshot
 ```
 
 List packages changed since a tag:
@@ -74,11 +76,11 @@ python3 scripts/borsch.py changes --tag v1.0.0
 Convert finished OSGeo4W release tarballs into repka-compatible repositories:
 
 ```bash
-python3 scripts/borsch.py package \
-  gdal openjpeg nextgisqgis ngstd sentrynative \
-  --release-root x86_64/release \
-  --artifacts-root nextgis/artifacts
+python3 scripts/borsch.py package
 ```
+
+When no package names are provided, `package` repacks all discovered source
+recipes and writes them to `nextgis/artifacts` using `x86_64/release`.
 
 Generate QtIFW overlay metadata from the repacked repositories:
 
