@@ -223,9 +223,13 @@ __marimo__/
 
 # OSGEO4W
 cygwin/
+*.msi
 *.exe
 *.zip
 *.obj
+*.dll
+*.lib
+*.pdb
 scripts/cmake
 tmp/
 *.tar.gz
@@ -234,6 +238,9 @@ package.log.*
 scripts/vs2019
 scripts/vs2022
 src/*/*-[0-9]*/
+src/*/*-v[0-9]*/
+src/*/osgeo4w/*-[0-9]*/
+src/*/osgeo4w/*-v[1-9]*/
 src/*/osgeo4w/install
 nextgis/artifacts/
 nextgis/qtifw/
