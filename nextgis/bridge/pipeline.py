@@ -54,6 +54,7 @@ CL_VERSION_RE = re.compile(r"Version\s+(?P<major>\d+)\.(?P<minor>\d+)")
 PACKAGE_VERSION_RE = re.compile(
     r"^(?P<version>.+)-(?P<binary>\d+|next|tbd)$"
 )
+COMPILER_BANNER_RE = re.compile(r"Compiler banner:\s*(?P<banner>.+)")
 
 
 @dataclass
@@ -592,6 +593,7 @@ def log_build_environment_summary(
     root_dir: Path,
     args: argparse.Namespace,
 ) -> None:
+    effective_release_root = resolve_effective_release_root(root_dir, args)
     runtime = get_active_runtime()
     runtime_name = "native"
     runtime_root = "PATH"
@@ -602,10 +604,13 @@ def log_build_environment_summary(
     LOGGER.info(f"Host OS: {platform.platform()}")
     LOGGER.info(f"Host Python: {platform.python_version()}")
     LOGGER.info(f"Execution runtime: {runtime_name} ({runtime_root})")
-    LOGGER.info(f"Progress bars: {'enabled' if LOGGING_SETTINGS.progress_enabled else 'disabled'}")
+    LOGGER.info(
+        "Progress bars: "
+        f"{'enabled' if LOGGING_SETTINGS.progress_enabled else 'disabled'}"
+    )
     LOGGER.info(
         "Paths: "
-        f"release={args.release_root.resolve()}, "
+        f"release={effective_release_root}, "
         f"artifacts={args.artifacts_root.resolve()}"
     )
 
@@ -637,28 +642,180 @@ def log_build_environment_summary(
 
 
 def detect_compiler_tag() -> str:
+    return detect_compiler_tag_for_root(None)
+
+
+def detect_compiler_tag_for_root(root_dir: Optional[Path]) -> str:
     explicit_value = os.environ.get("NEXTGIS_COMPILER_TAG")
     if explicit_value:
         return explicit_value
+    detected_tag = detect_compiler_tag_from_command(["cl"])
+    if detected_tag is not None:
+        return detected_tag
+    if root_dir is not None:
+        detected_tag = detect_compiler_tag_from_package_logs(root_dir)
+        if detected_tag is not None:
+            return detected_tag
+    for compiler_path in iter_compiler_candidates(root_dir):
+        detected_tag = detect_compiler_tag_from_command([str(compiler_path)])
+        if detected_tag is not None:
+            return detected_tag
+    return "unknown-compiler"
+
+
+def detect_compiler_tag_from_command(command: Sequence[str]) -> Optional[str]:
     try:
         result = subprocess.run(
-            ["cl"],
+            list(command),
             text=True,
             capture_output=True,
             check=False,
         )
     except FileNotFoundError:
-        return "unknown-compiler"
+        return None
     output = f"{result.stdout}\n{result.stderr}"
+    return parse_compiler_tag(output)
+
+
+def detect_compiler_tag_from_package_logs(root_dir: Path) -> Optional[str]:
+    log_paths = sorted(
+        root_dir.glob("src/*/osgeo4w/package.log*"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    for log_path in log_paths:
+        try:
+            log_text = log_path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        matches = COMPILER_BANNER_RE.findall(log_text)
+        for banner in reversed(matches):
+            detected_tag = parse_compiler_tag(banner)
+            if detected_tag is not None:
+                return detected_tag
+    return None
+
+
+def parse_compiler_tag(output: str) -> Optional[str]:
     match = CL_VERSION_RE.search(output)
     if match is None:
-        return "unknown-compiler"
-    suffix = (
-        "64bit"
-        if os.environ.get("Platform", "x64").lower() == "x64"
-        else "32bit"
-    )
+        return None
+    normalized_output = output.lower()
+    if "for x64" in normalized_output or "hostx64" in normalized_output:
+        suffix = "64bit"
+    elif "for x86" in normalized_output or "hostx86" in normalized_output:
+        suffix = "32bit"
+    else:
+        suffix = (
+            "64bit"
+            if os.environ.get("Platform", "x64").lower() == "x64"
+            else "32bit"
+        )
     return f"MSVC-{match.group('major')}.{match.group('minor')}-{suffix}"
+
+
+def iter_compiler_candidates(root_dir: Optional[Path]) -> Iterable[Path]:
+    candidates: List[Path] = []
+    seen_paths: Set[Path] = set()
+
+    def append_candidate(path: Path) -> None:
+        if path in seen_paths or not path.exists():
+            return
+        seen_paths.add(path)
+        candidates.append(path)
+
+    vctools_install_dir = os.environ.get("VCToolsInstallDir")
+    if vctools_install_dir:
+        for suffix in (
+            Path("bin/HostX64/x64/cl.exe"),
+            Path("bin/HostX86/x86/cl.exe"),
+        ):
+            append_candidate(Path(vctools_install_dir) / suffix)
+
+    compiler_roots: List[Path] = []
+    if root_dir is not None:
+        compiler_roots.extend(
+            [
+                root_dir / "scripts" / "vs2022" / "VC",
+                root_dir / "scripts" / "vs2019" / "VC",
+            ]
+        )
+
+    for base_dir in (
+        os.environ.get("PROGRAMFILES", ""),
+        os.environ.get("PROGRAMFILES(X86)", ""),
+    ):
+        if not base_dir:
+            continue
+        for year in ("2022", "2019"):
+            for edition in (
+                "Community",
+                "Professional",
+                "Enterprise",
+                "BuildTools",
+            ):
+                compiler_roots.append(
+                    Path(base_dir)
+                    / "Microsoft Visual Studio"
+                    / year
+                    / edition
+                    / "VC"
+                )
+
+    for compiler_root in compiler_roots:
+        for compiler_path in sorted(
+            compiler_root.glob("Tools/MSVC/*/bin/HostX64/x64/cl.exe"),
+            reverse=True,
+        ):
+            append_candidate(compiler_path)
+        for compiler_path in sorted(
+            compiler_root.glob("Tools/MSVC/*/bin/HostX86/x86/cl.exe"),
+            reverse=True,
+        ):
+            append_candidate(compiler_path)
+
+    return candidates
+
+
+def default_osgeo4w_repo(root_dir: Path) -> Path:
+    current_branch = capture_optional_command(
+        ["git", "branch", "--show-current"],
+        root_dir,
+    )
+    if current_branch == "master":
+        return root_dir
+    temp_root = Path(os.environ.get("TEMP", tempfile.gettempdir()))
+    return temp_root / f"repo-{current_branch}"
+
+
+def resolve_osgeo4w_repo(root_dir: Path, args: argparse.Namespace) -> Path:
+    if getattr(args, "osgeo4w_repo", None) is not None:
+        return args.osgeo4w_repo.resolve()
+    configured_repo = os.environ.get("OSGEO4W_REP")
+    if configured_repo:
+        return Path(configured_repo).resolve()
+    resolved_release_root = (
+        args.release_root.resolve()
+        if args.release_root.is_absolute()
+        else (root_dir / args.release_root).resolve()
+    )
+    if resolved_release_root.parts[-2:] == ("x86_64", "release"):
+        return resolved_release_root.parent.parent
+    return default_osgeo4w_repo(root_dir)
+
+
+def resolve_effective_release_root(
+    root_dir: Path,
+    args: argparse.Namespace,
+) -> Path:
+    if args.release_root.is_absolute():
+        return args.release_root.resolve()
+    if getattr(args, "osgeo4w_repo", None) is not None:
+        return (args.osgeo4w_repo.resolve() / args.release_root).resolve()
+    configured_repo = os.environ.get("OSGEO4W_REP")
+    if configured_repo:
+        return (Path(configured_repo).resolve() / args.release_root).resolve()
+    return (root_dir / args.release_root).resolve()
 
 
 def parse_archive_version(package_name: str, archive_name: str) -> str:
@@ -873,6 +1030,11 @@ def find_release_archives(
             for path in release_root.glob(f"**/{package_name}-*.tar.bz2")
             if not path.name.endswith("-src.tar.bz2")
         ]
+        exact_candidates = [
+            path for path in candidates if path.parent.name == package_name
+        ]
+        if exact_candidates:
+            candidates = exact_candidates
         if not candidates:
             raise FileNotFoundError(
                 f"No release archive found for {package_name} under {release_root}"
@@ -1167,15 +1329,40 @@ def xml_escape(value: str) -> str:
     )
 
 
+def format_path_for_runtime(path: Path) -> str:
+    runtime = get_active_runtime()
+    resolved_path = path.resolve()
+    if (
+        runtime is None
+        or not runtime.uses_cygwin
+        or runtime.cygpath_executable is None
+    ):
+        return str(resolved_path)
+    try:
+        result = subprocess.run(
+            [runtime.cygpath_executable, "-u", str(resolved_path)],
+            text=True,
+            capture_output=True,
+            check=True,
+            env=runtime.build_environment(),
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return str(resolved_path)
+    converted_path = result.stdout.strip()
+    return converted_path or str(resolved_path)
+
+
 def build_environment(args: argparse.Namespace) -> Dict[str, str]:
+    root_dir = args.root.resolve()
     environment: Dict[str, str] = {}
     environment["OSGEO4W_BRIDGE_LOG_PROTOCOL"] = "1"
     if not args.build_reverse_dependencies:
         environment["OSGEO4W_BUILD_RDEPS"] = "0"
     if args.continue_on_error:
         environment["OSGEO4W_CONTINUE_BUILD"] = "1"
-    if args.osgeo4w_repo:
-        environment["OSGEO4W_REP"] = str(args.osgeo4w_repo)
+    environment["OSGEO4W_REP"] = format_path_for_runtime(
+        resolve_osgeo4w_repo(root_dir, args)
+    )
     if args.quiet:
         environment["OSGEO4W_QUIET"] = "1"
     return environment
@@ -1249,6 +1436,7 @@ def bootstrap_command(args: argparse.Namespace) -> int:
 def build_command(args: argparse.Namespace) -> int:
     activate_runtime(args, bootstrap_if_missing=True)
     root_dir = args.root.resolve()
+    effective_release_root = resolve_effective_release_root(root_dir, args)
     log_build_environment_summary(root_dir, args)
     configuration = BridgeConfiguration.load(args.config.resolve())
     workspace = WorkspaceModel.discover(root_dir)
@@ -1304,12 +1492,12 @@ def build_command(args: argparse.Namespace) -> int:
         snapshot = workspace.snapshot(configuration)
         write_snapshot_file(snapshot, args.snapshot_output.resolve())
     if args.packaging_backend in {"borsch", "both"}:
-        compiler_tag = args.compiler_tag or detect_compiler_tag()
+        compiler_tag = args.compiler_tag or detect_compiler_tag_for_root(root_dir)
         LOGGER.info(f"Packaging repka artifacts with compiler tag {compiler_tag}")
         package_selected_sources(
             workspace=workspace,
             configuration=configuration,
-            release_root=args.release_root.resolve(),
+            release_root=effective_release_root,
             artifacts_root=args.artifacts_root.resolve(),
             source_names=build_targets,
             compiler_tag=compiler_tag,
@@ -1454,7 +1642,7 @@ def package_command(args: argparse.Namespace) -> int:
         )
     else:
         source_names = workspace.source_names()
-    compiler_tag = args.compiler_tag or detect_compiler_tag()
+    compiler_tag = args.compiler_tag or detect_compiler_tag_for_root(root_dir)
     LOGGER.info(
         f"Packaging {len(source_names)} repositories from {args.release_root.resolve()}"
     )
