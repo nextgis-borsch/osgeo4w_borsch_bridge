@@ -234,5 +234,6 @@ scripts/vs2022
 src/*/*-[0-9]*/
 src/*/osgeo4w/install
 nextgis/artifacts/
+src/*/osgeo4w/osgeo4w/
 x86_64/
 md5sums
