@@ -16,7 +16,6 @@ import tarfile
 import tempfile
 import threading
 import time
-import urllib.request
 import zipfile
 
 from dataclasses import dataclass
@@ -32,10 +31,12 @@ from .runtime import (
     bootstrap_cygwin,
     default_cygwin_root,
     get_active_runtime,
+    open_url,
     is_windows_host,
     remap_command,
     resolve_runtime,
     set_active_runtime,
+    set_active_proxy,
     set_runtime_progress_enabled,
 )
 
@@ -291,6 +292,7 @@ def sha256_chain(first_value: str, second_value: str) -> str:
 
 
 def configure_logging(args: argparse.Namespace) -> None:
+    log_level = getattr(logging, str(args.log_level).upper())
     LOGGING_SETTINGS.quiet = bool(args.quiet)
     LOGGING_SETTINGS.progress_enabled = bool(
         not args.quiet
@@ -304,7 +306,7 @@ def configure_logging(args: argparse.Namespace) -> None:
     root_logger = logging.getLogger(LOGGER_NAMESPACE)
     root_logger.handlers.clear()
     root_logger.propagate = False
-    root_logger.setLevel(logging.INFO)
+    root_logger.setLevel(log_level)
 
     handler = TqdmLoggingHandler(stream=sys.stdout)
     handler.setFormatter(
@@ -319,7 +321,7 @@ def configure_logging(args: argparse.Namespace) -> None:
         f"{LOGGER_NAMESPACE}.process",
     ):
         current_logger = logging.getLogger(logger_name)
-        current_logger.setLevel(logging.INFO)
+        current_logger.setLevel(log_level)
         current_logger.propagate = logger_name != LOGGER_NAMESPACE
 
     if LOGGING_SETTINGS.quiet:
@@ -929,13 +931,13 @@ def open_zip_reader(
 ) -> Tuple[zipfile.ZipFile, io.BytesIO]:
     if re.match(r"^https?://", artifacts_root):
         version_url = f"{artifacts_root.rstrip('/')}/{repo_name}/build/version.str"
-        with urllib.request.urlopen(version_url) as response:
+        with open_url(version_url) as response:
             version_lines = response.read().decode("utf-8").splitlines()
         archive_base = version_lines[2].strip()
         archive_url = (
             f"{artifacts_root.rstrip('/')}/{repo_name}/build/{archive_base}.zip"
         )
-        with urllib.request.urlopen(archive_url) as response:
+        with open_url(archive_url) as response:
             payload = io.BytesIO(response.read())
         return zipfile.ZipFile(payload), payload
     repo_root = Path(artifacts_root) / repo_name
@@ -1156,6 +1158,7 @@ def build_bootstrap_options(args: argparse.Namespace) -> BootstrapOptions:
         setup_executable=args.cygwin_setup.resolve()
         if args.cygwin_setup is not None
         else None,
+        proxy=args.proxy,
         force=getattr(args, "force", False),
     )
 
@@ -1485,6 +1488,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Cygwin mirror used when bootstrap installs a local runtime.",
     )
     parser.add_argument(
+        "--proxy",
+        default="",
+        help="Proxy URL used for network requests and Cygwin bootstrap.",
+    )
+    parser.add_argument(
         "--cygwin-cache",
         type=Path,
         help="Directory used as the local Cygwin package cache.",
@@ -1498,6 +1506,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--quiet",
         action="store_true",
         help="Suppress wrapper logs and child process output.",
+    )
+    parser.add_argument(
+        "--log-level",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        default="INFO",
+        help="Logging level for wrapper diagnostics.",
     )
     parser.add_argument(
         "--no-progress",
@@ -1686,6 +1700,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    set_active_proxy(args.proxy)
     configure_logging(args)
     return int(args.handler(args))
 
