@@ -361,31 +361,21 @@ vs2022env() {
 	export PATH="$vcdir/VC/bin:$PATH"
 	export CC=cl.exe
 	export CXX=cl.exe
+	# Do not patch MSVC STL headers in-place (usually under Program Files).
+	# Use CL env var to inject the required macro globally.
+	if [ -z "${CL:-}" ]; then
+		export CL="/D_DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR"
+	else
+		case " $CL " in
+		*" /D_DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR "*)
+			;;
+		*)
+			export CL="/D_DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR $CL"
+			;;
+		esac
+	fi
 	log "Compiler executables: $(type -p $CC) $(type -p $CXX)"
 	log "Compiler banner: $(cl 2>&1 | sed -n '1,2p' | tr '\r\n' ' ' | sed 's/[[:space:]]\+/ /g')"
-
-	(
-		cd /tmp
-
-		echo "#include <mutex>" >m.cpp
-		cl /nologo /P /C m.cpp
-		h=$(cygpath -a "$(sed -ne '2 s/#line 1 "\(.*\)".*$/\1/p' m.i)")
-		rm m.cpp m.i
-
-		cd "$(dirname "$h")"
-		while read h; do
-			if ! head -1 "$h" | grep -q "#ifndef _DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR"; then
-				rm -f /tmp/h
-
-				sed -e "1i \
-#ifndef _DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR\r\n\
-#define _DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR\r\n\
-#endif\r\n\r\
-" "$h" >/tmp/h
-				cat /tmp/h >"$h"
-			fi
-		done < <(grep -Rl _DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR .)
-	)
 }
 declare -x vs2022env
 
