@@ -5,6 +5,7 @@ import gzip
 import hashlib
 import io
 import json
+import logging
 import os
 import platform
 import re
@@ -22,7 +23,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from queue import Empty, Queue
-from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Dict, IO, Iterable, List, Optional, Sequence, Set, Tuple
 
 from .config import BridgeConfiguration, QtIfwComponent
 from .runtime import (
@@ -35,6 +36,7 @@ from .runtime import (
     remap_command,
     resolve_runtime,
     set_active_runtime,
+    set_runtime_progress_enabled,
 )
 
 try:
@@ -61,6 +63,24 @@ class LoggingSettings:
 
 
 LOGGING_SETTINGS = LoggingSettings()
+LOGGER_NAMESPACE = "osgeo4w_borsch_bridge"
+LOGGER = logging.getLogger(f"{LOGGER_NAMESPACE}.pipeline")
+PROCESS_LOGGER = logging.getLogger(f"{LOGGER_NAMESPACE}.process")
+
+
+class TqdmLoggingHandler(logging.StreamHandler):
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            message = self.format(record)
+            output_stream = sys.stderr if record.levelno >= logging.ERROR else sys.stdout
+            if LOGGING_SETTINGS.progress_enabled and tqdm_module is not None:
+                tqdm_module.write(message, file=output_stream)
+            else:
+                stream = output_stream
+                stream.write(message + self.terminator)
+                self.flush()
+        except Exception:
+            self.handleError(record)
 
 
 @dataclass
@@ -279,20 +299,45 @@ def configure_logging(args: argparse.Namespace) -> None:
         and sys.stdout.isatty()
     )
     LOGGING_SETTINGS.heartbeat_seconds = int(args.heartbeat_seconds)
+    set_runtime_progress_enabled(not args.quiet and not args.no_progress)
 
+    root_logger = logging.getLogger(LOGGER_NAMESPACE)
+    root_logger.handlers.clear()
+    root_logger.propagate = False
+    root_logger.setLevel(logging.INFO)
 
-def emit_log_line(message: str) -> None:
-    if LOGGING_SETTINGS.progress_enabled and tqdm_module is not None:
-        tqdm_module.write(message)
-        return
-    print(message, flush=True)
+    handler = TqdmLoggingHandler(stream=sys.stdout)
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s: [%(name)s] %(levelname)s %(message)s")
+    )
+    root_logger.addHandler(handler)
 
+    for logger_name in (
+        LOGGER_NAMESPACE,
+        f"{LOGGER_NAMESPACE}.pipeline",
+        f"{LOGGER_NAMESPACE}.runtime",
+        f"{LOGGER_NAMESPACE}.process",
+    ):
+        current_logger = logging.getLogger(logger_name)
+        current_logger.setLevel(logging.INFO)
+        current_logger.propagate = logger_name != LOGGER_NAMESPACE
 
-def log_message(message: str) -> None:
     if LOGGING_SETTINGS.quiet:
-        return
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    emit_log_line(f"{timestamp}: [nextgis] {message}")
+        for logger_name in (
+            LOGGER_NAMESPACE,
+            f"{LOGGER_NAMESPACE}.pipeline",
+            f"{LOGGER_NAMESPACE}.runtime",
+            f"{LOGGER_NAMESPACE}.process",
+        ):
+            logging.getLogger(logger_name).disabled = True
+    else:
+        for logger_name in (
+            LOGGER_NAMESPACE,
+            f"{LOGGER_NAMESPACE}.pipeline",
+            f"{LOGGER_NAMESPACE}.runtime",
+            f"{LOGGER_NAMESPACE}.process",
+        ):
+            logging.getLogger(logger_name).disabled = False
 
 
 def format_command(args: Sequence[str]) -> str:
@@ -352,58 +397,83 @@ def stream_subprocess_output(
         env=merged_environment,
         text=True,
         stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
+        stderr=subprocess.PIPE,
         bufsize=1,
     )
-    output_queue: Queue[Optional[str]] = Queue()
-    output_lines: List[str] = []
+    output_queue: Queue[Tuple[str, Optional[str]]] = Queue()
+    stdout_lines: List[str] = []
+    stderr_lines: List[str] = []
 
-    def read_output() -> None:
-        assert process.stdout is not None
-        for line in process.stdout:
-            output_queue.put(line)
-        output_queue.put(None)
+    def read_stream(stream_name: str, stream: Optional[IO[str]]) -> None:
+        if stream is None:
+            output_queue.put((stream_name, None))
+            return
+        for line in stream:
+            output_queue.put((stream_name, line))
+        output_queue.put((stream_name, None))
 
-    reader_thread = threading.Thread(target=read_output, daemon=True)
-    reader_thread.start()
+    stdout_thread = threading.Thread(
+        target=read_stream,
+        args=("stdout", process.stdout),
+        daemon=True,
+    )
+    stderr_thread = threading.Thread(
+        target=read_stream,
+        args=("stderr", process.stderr),
+        daemon=True,
+    )
+    stdout_thread.start()
+    stderr_thread.start()
     heartbeat_deadline = time.monotonic() + LOGGING_SETTINGS.heartbeat_seconds
+    completed_streams = set()
 
-    while True:
+    while len(completed_streams) < 2:
         try:
-            line = output_queue.get(timeout=1.0)
+            stream_name, line = output_queue.get(timeout=1.0)
         except Empty:
             if process.poll() is not None and output_queue.empty():
                 break
             if time.monotonic() >= heartbeat_deadline:
-                log_message(f"Still running: {description}")
+                LOGGER.info(f"Still running: {description}")
                 heartbeat_deadline = (
                     time.monotonic() + LOGGING_SETTINGS.heartbeat_seconds
                 )
             continue
 
         if line is None:
-            break
+            completed_streams.add(stream_name)
+            continue
 
-        output_lines.append(line)
         heartbeat_deadline = (
             time.monotonic() + LOGGING_SETTINGS.heartbeat_seconds
         )
-        sys.stdout.write(line)
-        sys.stdout.flush()
+        if stream_name == "stdout":
+            stdout_lines.append(line)
+            sys.stdout.write(line)
+            sys.stdout.flush()
+            continue
+
+        stderr_lines.append(line)
+        PROCESS_LOGGER.error(line.rstrip())
+
+    stdout_thread.join(timeout=0)
+    stderr_thread.join(timeout=0)
 
     return_code = process.wait()
-    stdout_text = "".join(output_lines)
+    stdout_text = "".join(stdout_lines)
+    stderr_text = "".join(stderr_lines)
     if return_code != 0:
         raise subprocess.CalledProcessError(
             return_code,
             list(args),
             output=stdout_text,
+            stderr=stderr_text,
         )
     return subprocess.CompletedProcess(
         list(args),
         return_code,
         stdout=stdout_text,
-        stderr="",
+        stderr=stderr_text,
     )
 
 
@@ -425,9 +495,9 @@ def run_command(
 
     command_text = format_command(args)
     if description:
-        log_message(f"{description}: {command_text}")
+        LOGGER.info(f"{description}: {command_text}")
     elif not capture_output:
-        log_message(f"Running command: {command_text}")
+        LOGGER.info(f"Running command: {command_text}")
 
     if capture_output:
         return subprocess.run(
@@ -490,11 +560,11 @@ def log_build_environment_summary(
         runtime_name = "cygwin"
         runtime_root = str(runtime.cygwin_root)
 
-    log_message(f"Host OS: {platform.platform()}")
-    log_message(f"Host Python: {platform.python_version()}")
-    log_message(f"Execution runtime: {runtime_name} ({runtime_root})")
-    log_message(f"Progress bars: {'enabled' if LOGGING_SETTINGS.progress_enabled else 'disabled'}")
-    log_message(
+    LOGGER.info(f"Host OS: {platform.platform()}")
+    LOGGER.info(f"Host Python: {platform.python_version()}")
+    LOGGER.info(f"Execution runtime: {runtime_name} ({runtime_root})")
+    LOGGER.info(f"Progress bars: {'enabled' if LOGGING_SETTINGS.progress_enabled else 'disabled'}")
+    LOGGER.info(
         "Paths: "
         f"release={args.release_root.resolve()}, "
         f"artifacts={args.artifacts_root.resolve()}"
@@ -502,8 +572,8 @@ def log_build_environment_summary(
 
     bash_version = capture_optional_command(["bash", "--version"], root_dir)
     git_version = capture_optional_command(["git", "--version"], root_dir)
-    log_message(f"Bash: {bash_version}")
-    log_message(f"Git: {git_version}")
+    LOGGER.info(f"Bash: {bash_version}")
+    LOGGER.info(f"Git: {git_version}")
 
     if runtime is not None and runtime.uses_cygwin:
         cygwin_os = capture_optional_command(
@@ -514,17 +584,17 @@ def log_build_environment_summary(
             ["cygpath", "--version"],
             root_dir,
         )
-        log_message(f"Cygwin OS: {cygwin_os}")
-        log_message(f"Cygwin tools: {cygpath_version}")
+        LOGGER.info(f"Cygwin OS: {cygwin_os}")
+        LOGGER.info(f"Cygwin tools: {cygpath_version}")
 
     compiler_banner = capture_optional_command(["cl"], root_dir)
     if compiler_banner in {"unknown", "not found"}:
-        log_message(
+        LOGGER.info(
             "Compiler: not yet available in the wrapper environment; "
             "recipe-level compiler details will be logged after vsenv()."
         )
     else:
-        log_message(f"Compiler: {compiler_banner}")
+        LOGGER.info(f"Compiler: {compiler_banner}")
 
 
 def detect_compiler_tag() -> str:
@@ -1108,7 +1178,7 @@ def activate_runtime(
     if runtime.uses_cygwin and runtime.cygwin_root is not None:
         runtime_name = "cygwin"
         runtime_root = str(runtime.cygwin_root)
-    log_message(
+    LOGGER.info(
         f"Runtime={runtime_name}, root={runtime_root}, workspace={args.root.resolve()}"
     )
 
@@ -1116,7 +1186,7 @@ def activate_runtime(
 def bootstrap_command(args: argparse.Namespace) -> int:
     root_dir = args.root.resolve()
     if not is_windows_host():
-        print("Cygwin bootstrap is only required on Windows hosts.")
+        LOGGER.info("Cygwin bootstrap is only required on Windows hosts.")
         return 0
     set_active_runtime(None)
     target_root = (
@@ -1124,13 +1194,13 @@ def bootstrap_command(args: argparse.Namespace) -> int:
         if args.cygwin_root is not None
         else default_cygwin_root(root_dir)
     )
-    log_message(f"Bootstrapping Cygwin into {target_root}")
+    LOGGER.info(f"Bootstrapping Cygwin into {target_root}")
     installed_root = bootstrap_cygwin(
         root_dir=root_dir,
         cygwin_root=target_root,
         options=build_bootstrap_options(args),
     )
-    log_message(f"Cygwin runtime is ready at {installed_root}")
+    LOGGER.info(f"Cygwin runtime is ready at {installed_root}")
     print(installed_root)
     return 0
 
@@ -1153,11 +1223,11 @@ def build_command(args: argparse.Namespace) -> int:
         include_reverse_dependencies=args.build_reverse_dependencies,
         disabled=disabled,
     )
-    log_message(
+    LOGGER.info(
         f"Build plan contains {len(build_targets)} packages; backend={args.packaging_backend}"
     )
     if build_targets:
-        log_message(f"Build targets: {' '.join(build_targets)}")
+        LOGGER.info(f"Build targets: {' '.join(build_targets)}")
     environment = build_environment(args)
     if args.repka_root and not args.ignore_repka:
         bootstrap_names = workspace.bootstrap_sources(
@@ -1165,7 +1235,7 @@ def build_command(args: argparse.Namespace) -> int:
             disabled=disabled,
         )
         osgeo4w_root = ensure_osgeo4w_root(root_dir)
-        log_message(
+        LOGGER.info(
             f"Hydrating {len(bootstrap_names)} dependency repositories into {osgeo4w_root}"
         )
         for source_name in iter_with_progress(
@@ -1189,12 +1259,12 @@ def build_command(args: argparse.Namespace) -> int:
             description="Executing OSGeo4W build pipeline",
         )
     if args.snapshot_output:
-        log_message(f"Writing snapshot to {args.snapshot_output.resolve()}")
+        LOGGER.info(f"Writing snapshot to {args.snapshot_output.resolve()}")
         snapshot = workspace.snapshot(configuration)
         write_snapshot_file(snapshot, args.snapshot_output.resolve())
     if args.packaging_backend in {"borsch", "both"}:
         compiler_tag = args.compiler_tag or detect_compiler_tag()
-        log_message(f"Packaging repka artifacts with compiler tag {compiler_tag}")
+        LOGGER.info(f"Packaging repka artifacts with compiler tag {compiler_tag}")
         package_selected_sources(
             workspace=workspace,
             configuration=configuration,
@@ -1204,7 +1274,7 @@ def build_command(args: argparse.Namespace) -> int:
             compiler_tag=compiler_tag,
         )
         if args.qtifw_output:
-            log_message(
+            LOGGER.info(
                 f"Generating QtIFW overlay into {args.qtifw_output.resolve()}"
             )
             generate_qtifw_overlay(
@@ -1235,7 +1305,7 @@ def package_selected_sources(
     source_name_list = sorted(source_names)
     for source_name in iter_with_progress(source_name_list, "package"):
         recipe = workspace.recipes[source_name]
-        log_message(f"Packaging source recipe {source_name}")
+        LOGGER.info(f"Packaging source recipe {source_name}")
         package_source_recipe(
             recipe=recipe,
             configuration=configuration,
@@ -1265,7 +1335,7 @@ def package_msi(
     environment["PKGS"] = " ".join(sorted(msi_sources))
     if mirror:
         environment["mirror"] = mirror
-    log_message(f"Building MSI packages for: {' '.join(sorted(msi_sources))}")
+    LOGGER.info(f"Building MSI packages for: {' '.join(sorted(msi_sources))}")
     run_command(
         ["bash", "scripts/msis.sh"],
         cwd=root_dir,
@@ -1302,12 +1372,12 @@ def snapshot_command(args: argparse.Namespace) -> int:
     root_dir = args.root.resolve()
     configuration = BridgeConfiguration.load(args.config.resolve())
     workspace = WorkspaceModel.discover(root_dir)
-    log_message(
+    LOGGER.info(
         f"Generating snapshot for {len(workspace.recipes)} source recipes"
     )
     snapshot = workspace.snapshot(configuration)
     write_snapshot_file(snapshot, args.output.resolve())
-    log_message(f"Snapshot written to {args.output.resolve()}")
+    LOGGER.info(f"Snapshot written to {args.output.resolve()}")
     return 0
 
 
@@ -1322,7 +1392,7 @@ def changes_command(args: argparse.Namespace) -> int:
         configuration=configuration,
         tag_name=args.tag,
     )
-    log_message(
+    LOGGER.info(
         f"Detected {len(changed_names)} changed packages since tag {args.tag}"
     )
     if args.output_format == "json":
@@ -1344,7 +1414,7 @@ def package_command(args: argparse.Namespace) -> int:
     else:
         source_names = workspace.source_names()
     compiler_tag = args.compiler_tag or detect_compiler_tag()
-    log_message(
+    LOGGER.info(
         f"Packaging {len(source_names)} repositories from {args.release_root.resolve()}"
     )
     package_selected_sources(
@@ -1375,7 +1445,7 @@ def qtifw_command(args: argparse.Namespace) -> int:
                 / configuration.describe(recipe.name, recipe.package_names).repo_name
             ).exists()
         }
-    log_message(
+    LOGGER.info(
         f"Generating QtIFW metadata for {len(source_names)} repositories"
     )
     generate_qtifw_overlay(
