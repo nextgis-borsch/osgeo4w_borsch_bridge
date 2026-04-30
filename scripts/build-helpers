@@ -942,8 +942,10 @@ curl() { /bin/curl "$@"; }
 catdoc() { /bin/catdoc "$@"; }
 iconv() { /bin/iconv "$@"; }
 wget() { /bin/wget "$@"; }
+pip() { python3 -m pip "$@"; }
+pip3() { python3 -m pip "$@"; }
 
-declare -x awk bash cat cp rm mkdir tar ls sed diff patch find xargs flip touch unzip cygpath catdoc iconv wget
+declare -x awk bash cat cp rm mkdir tar ls sed diff patch find xargs flip touch unzip cygpath catdoc iconv wget pip pip3
 
 init() {
 	if [ -n "${OSGEO4W_ROOT:-}" ]; then

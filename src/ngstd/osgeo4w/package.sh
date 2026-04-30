@@ -1,7 +1,7 @@
 export P=ngstd
 export B=next
 export MAINTAINER=NextGIS
-export BUILDDEPENDS="gdal-devel openssl-devel python3-core python3-devel python3-pyqt5 python3-pyqt-builder python3-sip qt5-devel sentrynative-devel zlib-devel"
+export BUILDDEPENDS="base gdal-devel openssl-devel python3-core python3-devel python3-pyqt5 python3-pyqt-builder python3-sip qt5-devel sentrynative-devel zlib-devel"
 export PACKAGES="ngstd ngstd-devel python3-ngstd"
 
 : ${REPO:=https://github.com/nextgis/lib_ngstd.git}

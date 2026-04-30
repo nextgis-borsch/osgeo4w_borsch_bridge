@@ -2,7 +2,7 @@ export P=python3
 export V=3.12.13
 export B="next $P-core"
 export MAINTAINER=JuergenFischer
-export BUILDDEPENDS="openssl-devel bzip2-devel xz-devel zlib-devel sqlite3-devel"
+export BUILDDEPENDS="base openssl-devel bzip2-devel xz-devel zlib-devel sqlite3-devel"
 export PACKAGES="python3-core python3-devel python3-help python3-tcltk python3-test python3-tools"
 
 source ../../../scripts/build-helpers
@@ -40,6 +40,11 @@ MMM=${V//./}
 	[ -f osgeo4w.built ] || {
 		DISTVERSION=$V cmd /c Doc\\make.bat htmlhelp
 		[ -f Doc/build/htmlhelp/python$MMM.chm ]
+		# buildrelease.bat still tries to build the x86 launcher even with
+		# --skip-msi; the package does not need launcher.msi, so provide the
+		# sentinel it checks for and keep the build on the x64 path only.
+		mkdir -p PCbuild/win32/en-us
+		: >PCbuild/win32/en-us/launcher.msi
 		cmd /c Tools\\msi\\buildrelease.bat -x64 --skip-msi --skip-nuget --skip-zip
 		touch osgeo4w.built
 	}

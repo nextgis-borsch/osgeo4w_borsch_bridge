@@ -1,7 +1,7 @@
 export P=sentrynative
 export B=next
 export MAINTAINER=NextGIS
-export BUILDDEPENDS="curl-devel zlib-devel"
+export BUILDDEPENDS="base curl-devel zlib-devel"
 export PACKAGES="sentrynative sentrynative-devel"
 
 : ${REPO:=https://github.com/nextgis-borsch/lib_sentrynative.git}

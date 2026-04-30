@@ -2,7 +2,7 @@ export P=netcdf
 export V=4.9.2
 export B=next
 export MAINTAINER=JuergenFischer
-export BUILDDEPENDS="hdf4-devel hdf5-devel curl-devel zlib-devel hdf5-tools szip-devel bzip2-devel zstd-devel libxml2-devel"
+export BUILDDEPENDS="hdf4-devel hdf5-devel curl-devel zlib-devel hdf5-tools szip-devel bzip2-devel zstd-devel libxml2-devel libiconv-devel"
 export PACKAGES="netcdf netcdf-devel netcdf-tools"
 
 source ../../../scripts/build-helpers
@@ -82,7 +82,7 @@ cat <<EOF >$R/setup.hint
 sdesc: "The NetCDF library and commands for reading and writing NetCDF format (Runtime)"
 ldesc: "The NetCDF library and commands for reading and writing NetCDF format (Runtime)"
 category: Libs
-requires: base hdf4 hdf5 curl zlib szip
+requires: base hdf4 hdf5 curl zlib szip libxml2 libiconv
 maintainer: $MAINTAINER
 EOF
 
